@@ -1,0 +1,38 @@
+# ── Core numerical / video ────────────────────────────────────────────────────
+numpy>=1.23
+opencv-python>=4.8          # includes cv2.FaceDetectorYN (YuNet) built-in
+
+# ── Action model (R3D-18 sliding-window inference) ────────────────────────────
+torch>=2.0
+torchvision>=0.15
+# GPU build (H200/CUDA 12.1):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ── ONNX inference (YOLOv8n person detection + ArcFace face embeddings) ───────
+# GPU (H200 / any CUDA 11.8+):  install this — it includes the CPU provider too
+onnxruntime-gpu>=1.17
+# CPU-only fallback (cannot coexist with onnxruntime-gpu):
+#   pip uninstall onnxruntime-gpu && pip install onnxruntime>=1.16
+
+# ── YOLO model auto-export (one-time setup if yolov8n.onnx is absent) ─────────
+ultralytics>=8.0               # auto-exports yolov8n.onnx via fr_core._ensure_onnx
+
+# ── InsightFace models (optional — only needed if det_10g/w600k_r50 missing) ──
+# insightface>=0.7             # uncomment to auto-locate models from local cache
+#   Usage: python -c "import insightface; insightface.app.FaceAnalysis(name='buffalo_l').prepare(ctx_id=0)"
+
+# ── Face recognition vector DB ────────────────────────────────────────────────
+pymilvus>=2.3
+
+# ── Kafka publishing ──────────────────────────────────────────────────────────
+confluent-kafka>=2.3
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+psutil>=5.9                 # RAM / CPU sampling in benchmarks
+matplotlib>=3.7             # correlation timeline plot
+tqdm>=4.64                  # progress bars
+
+# ── System dependency (not a Python package) ──────────────────────────────────
+# ffmpeg >= 4.4   required for web-compatible H.264 output (-movflags +faststart)
+#   Ubuntu/Debian: sudo apt install ffmpeg
+#   RHEL/Rocky:    sudo dnf install ffmpeg

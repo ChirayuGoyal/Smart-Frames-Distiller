@@ -1,0 +1,76 @@
+{
+  "input_video": "",
+  "annotate": true,
+  "device": "auto",
+  "prefer_torch": true,
+  "inference_max_side": 480,
+  "inference_scale": 1.0,
+  "clip_len": 16,
+  "sample_stride": 8,
+  "compare_stride": 8,
+  "conf_delta": 0.15,
+  "max_gap": 30,
+  "neighbor_pad": 2,
+  "reencode_h264": true,
+  "output_resolution": {
+    "width": 640,
+    "height": 480
+  },
+  "run_id": "test-run-12345",
+  "camera_id": "cam-001",
+  "site_id": "site-001",
+  "chunk_duration_sec": 5,
+  "skip_kafka": false,
+  "chunks_dir": "",
+  "description": "CPU-only defaults - set input_video. Kafka publishing is ON by default; use --skip-kafka or set skip_kafka:true to disable. chunks_dir (or --chunks-dir DIR) saves N-second UUID-named filtered-clip chunks to a folder, independent of Kafka. Chunk length = chunk_duration_sec (or --chunk-duration). --save-full-clip PATH copies the whole filtered clip to an exact path. kafka.debug enables librdkafka internal logging (set to '' to silence).",
+  "kafka": {
+    "enabled": true,
+    "required": false,
+    "brokers": "10.178.120.135:9092",
+    "topic": "semantic-chunks-data",
+    "client_id": "action-aware-chunk-producer",
+    "assets_base": "/jvadata/vst/assets",
+    "sp_enabled": "true",
+    "critic_enabled": "true",
+    "debug": "broker,topic,msg,protocol",
+    "embed_frame_metadata": true
+  },
+  "face_recognition": {
+    "enabled": false,
+    "device": "auto",
+    "site_id": "site-001",
+    "person_model": "FREmbeddings/Model/yolov8n.onnx",
+    "person_conf": 0.4,
+    "detector_type": "yunet",
+    "yunet_model": "FREmbeddings/Model/face_detection_yunet_2023mar.onnx",
+    "detector_model": "FREmbeddings/Model/det_10g.onnx",
+    "embedding_model": "FREmbeddings/Model/w600k_r50.onnx",
+    "milvus": {
+      "host": "10.178.120.159",
+      "port": 19530,
+      "collection": "face_registry"
+    },
+    "similarity_threshold": 0.45,
+    "det_threshold": 0.5,
+    "frame_skip": 5,
+    "track_iou_thresh": 0.4,
+    "track_max_age": 30,
+    "track_history": 7,
+    "onboard_stride": 20
+  },
+  "benchmark": {
+    "cloud_gpu_hourly_usd": 0.45,
+    "notes": "device=auto: uses CUDA if available, falls back to CPU"
+  },
+  "visualization": {
+    "remove_border_color": [
+      0,
+      0,
+      255
+    ],
+    "remove_label": "REMOVE",
+    "remove_dim_factor": 0.45,
+    "show_frame_number": true,
+    "show_stats_banner": true
+  }
+}
