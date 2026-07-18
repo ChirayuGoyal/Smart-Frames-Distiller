@@ -143,6 +143,7 @@ def build_chunk_message(
     critic_enabled: str = "true",
     sp: str | None = None,
     critic: str | None = None,
+    app_id: int = 0,
 ) -> dict[str, Any]:
     sp_flag    = str(sp_enabled).lower()
     critic_flag = str(critic_enabled).lower()
@@ -151,6 +152,7 @@ def build_chunk_message(
     alert_critic = critic if critic is not None else critic_flag
     return {
         "event_id": event_id or str(uuid.uuid4()),
+        "app_id": app_id,
         "camera_id": camera_id,
         "site_id": site_id,
         "chunk_id": chunk_id,
@@ -166,7 +168,7 @@ def build_chunk_message(
                 "critic": alert_critic,
             },
         },
-        "run_id": run_id,
+        "asset_id": run_id,
     }
 
 

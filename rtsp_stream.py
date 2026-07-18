@@ -120,16 +120,23 @@ class RTSPStreamProcessor:
         self.opts            = opts
         self.kafka_overrides = kafka_overrides or {}
 
-        self.model = create_action_model(
-            clip_len=getattr(opts, "clip_len",         16),
-            prefer_torch=getattr(opts, "prefer_torch",  True),
-            device=getattr(opts, "device",             "auto"),
-            ensemble=getattr(opts, "ensemble",         False),
-            model_path=getattr(opts, "model_path",     None),
-            cache_dir=getattr(opts, "model_cache_dir", None),
-        )
+        # Day/night detection and model creation happen in run() after the first
+        # frames are read from the already-open cap — opening a second RTSP
+        # connection for detection is unreliable and wastes a connection slot.
+        self._night_mode: bool = False      # resolved in run()
+        self.model      = None              # set in run() if day mode
+        self._ir_detector: Any = None      # set in run() if night mode
 
-        # Inference ring — downscaled frames for the action model
+        # ROI mask — loaded once at startup; None = full frame
+        self._roi_mask: np.ndarray | None = None
+        _roi_path = getattr(opts, "roi_path", None)
+        if _roi_path:
+            # Defer mask creation to run() where we know the frame dimensions
+            self._roi_path: str | None = _roi_path
+        else:
+            self._roi_path = None
+
+        # Inference ring — downscaled frames for the action model (day mode only)
         self._infer_ring: deque[np.ndarray] = deque(maxlen=getattr(opts, "clip_len", 16))
 
         # Frame ring — ALL frames with their frame index, used to build chunks.
@@ -307,6 +314,7 @@ class RTSPStreamProcessor:
                 critic_enabled=cfg.get("critic_enabled", "true"),
                 sp=cfg.get("sp"),
                 critic=cfg.get("critic"),
+                app_id=int(getattr(opts, "app_id", 0)),
             )
             publish_chunk(msg, cfg=cfg)
 
@@ -354,6 +362,71 @@ class RTSPStreamProcessor:
         self._cluster_start = None
         self._cluster_end   = None
 
+    # ── per-frame processing ──────────────────────────────────────────────────────
+
+    def _step(
+        self,
+        frame: np.ndarray,
+        fps: float,
+        width: int,
+        height: int,
+        half_n: int,
+        frames_per_chunk: int,
+        clip_len: int,
+        sample_stride: int,
+        inf_scale: float,
+        inf_max_side: int | None,
+        buf_capacity: int,
+    ) -> None:
+        """Buffer one frame, run inference, and manage the active cluster."""
+        # Buffer ALL frames so cluster extraction always has enough context
+        self._frame_buf.append((self._frame_idx, frame.copy()))
+        while len(self._frame_buf) > buf_capacity:
+            self._frame_buf.popleft()
+
+        # Apply ROI mask to inference input only; original goes to the chunk
+        inf_frame = frame
+        if self._roi_mask is not None:
+            inf_frame = cv2.bitwise_and(frame, frame, mask=self._roi_mask)
+
+        # Inference — IR every frame, action model at stride
+        if self._night_mode:
+            if self._bench:
+                self._bench.start("inference")
+            ir_result = self._ir_detector.process_frame(inf_frame)
+            if self._bench:
+                self._bench.end("inference")
+            if ir_result.is_motion:
+                self._update_cluster(self._frame_idx, half_n)
+        else:
+            resized = resize_for_inference(inf_frame, inf_scale, inf_max_side)
+            self._infer_ring.append(resized)
+            if self._frame_idx % sample_stride == 0 and self._infer_ring:
+                clip = self._build_clip(clip_len)
+                if self._bench:
+                    self._bench.start("inference")
+                pred = self.model.predict_batch([(self._frame_idx, clip)])[0]
+                if self._bench:
+                    self._bench.end("inference")
+                if self._is_trigger(pred):
+                    self._update_cluster(self._frame_idx, half_n)
+                else:
+                    if self._cluster_start is None:
+                        self._quiet_pred = pred
+                self._last_pred = pred
+
+        # Cluster flush
+        if self._cluster_start is not None:
+            cluster_age = self._frame_idx - self._cluster_start
+            if cluster_age >= frames_per_chunk:
+                log.debug("cluster max-dur flush  start=%d  age=%d fr",
+                          self._cluster_start, cluster_age)
+                self._flush_cluster(fps, width, height)
+            elif self._frame_idx > self._cluster_end:
+                self._flush_cluster(fps, width, height)
+
+        self._frame_idx += 1
+
     # ── main loop ─────────────────────────────────────────────────────────────────
 
     def run(self) -> dict[str, Any]:
@@ -374,27 +447,84 @@ class RTSPStreamProcessor:
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        opts          = self.opts
+        opts = self.opts
+
+        # ── Sample first frames for day/night detection ───────────────────────
+        # Read from the already-open cap — avoids a second RTSP connection that
+        # is unreliable and silently defaults to day mode when it fails.
+        sat_thresh  = getattr(opts, "day_night_sat_threshold", 30.0)
+        n_sample    = getattr(opts, "day_night_sample_frames", 30)
+        forced_mode = getattr(opts, "view_mode", "auto")
+
+        sample_frames: list[np.ndarray] = []
+        for _ in range(n_sample):
+            ok, frame = cap.read()
+            if ok:
+                sample_frames.append(frame.copy())
+
+        if forced_mode in ("day", "night"):
+            _view_mode: str = forced_mode
+            log.info("view mode: forced=%s", forced_mode)
+        else:
+            from day_night_detector import detect_from_frames
+            _view_mode = detect_from_frames(sample_frames, saturation_threshold=sat_thresh)
+
+        self._night_mode = (_view_mode == "night")
+
+        # ── Create model / detector ───────────────────────────────────────────
         clip_len      = getattr(opts, "clip_len",          16)
         sample_stride = getattr(opts, "sample_stride",      4)
         inf_scale     = getattr(opts, "inference_scale",    1.0)
         inf_max_side  = getattr(opts, "inference_max_side", None)
 
-        # half_n: frames on each side of an event (= N/2 seconds)
+        if not self._night_mode:
+            self.model = create_action_model(
+                clip_len=clip_len,
+                prefer_torch=getattr(opts, "prefer_torch",  True),
+                device=getattr(opts, "device",              "auto"),
+                ensemble=getattr(opts, "ensemble",          False),
+                model_path=getattr(opts, "model_path",      None),
+                cache_dir=getattr(opts, "model_cache_dir",  None),
+            )
+            log.info("day mode — action model loaded")
+        else:
+            from detectors.ir_motion_detector import IRMotionConfig, IRMotionDetector
+            _ir_cfg_d: dict[str, Any] = getattr(opts, "ir_mode_cfg", {})
+            _ir_cfg = IRMotionConfig(
+                method=str(_ir_cfg_d.get("method", "ensemble")),
+                sensitivity=str(_ir_cfg_d.get("sensitivity", "medium")),
+            )
+            _ir_cfg.apply_preset()
+            self._ir_detector = IRMotionDetector(_ir_cfg)
+            log.info("night mode — IR detector: method=%s  sensitivity=%s",
+                     _ir_cfg.method, _ir_cfg.sensitivity)
+
+        # ── Cluster / buffer parameters ───────────────────────────────────────
         half_n           = int(round(fps * opts.chunk_duration_sec / 2))
         frames_per_chunk = int(round(fps * opts.chunk_duration_sec))
-
-        # Ring buffer must hold at least 2.5 × N seconds so pre-padding frames
-        # are still present when the cluster is eventually flushed.
-        buf_capacity       = int(fps * opts.chunk_duration_sec * 2.5) + 100
+        buf_capacity     = int(fps * opts.chunk_duration_sec * 2.5) + 100
         self._buf_capacity = buf_capacity
+
+        # ── ROI mask ──────────────────────────────────────────────────────────
+        if self._roi_path and self._roi_mask is None:
+            from roi_loader import load_roi
+            self._roi_mask = load_roi(self._roi_path, width, height).mask
+            log.info("ROI mask loaded from %s", self._roi_path)
 
         log.info(
             "stream   fps=%.1f  %dx%d  stride=%d  clip_len=%d  "
-            "chunk_dur=%.0fs  half_n=%d fr  ring_buf=%d fr",
+            "chunk_dur=%.0fs  half_n=%d fr  ring_buf=%d fr  mode=%s  roi=%s",
             fps, width, height, sample_stride, clip_len,
             opts.chunk_duration_sec, half_n, buf_capacity,
+            _view_mode, "yes" if self._roi_mask is not None else "no",
         )
+
+        # ── Replay sample frames through the pipeline ─────────────────────────
+        # These were read before any model existed; process them now so no
+        # motion/action in the opening seconds is missed.
+        for frame in sample_frames:
+            self._step(frame, fps, width, height, half_n, frames_per_chunk,
+                       clip_len, sample_stride, inf_scale, inf_max_side, buf_capacity)
 
         try:
             while True:
@@ -405,63 +535,19 @@ class RTSPStreamProcessor:
                     time.sleep(2)
                     cap = self._open()
                     continue
-
-                # ── Buffer ALL frames (for cluster extraction) ──────────────────
-                self._frame_buf.append((self._frame_idx, frame.copy()))
-                while len(self._frame_buf) > buf_capacity:
-                    self._frame_buf.popleft()
-
-                # ── Action model inference every stride frames ────────────────────
-                resized = resize_for_inference(frame, inf_scale, inf_max_side)
-                self._infer_ring.append(resized)
-
-                if self._frame_idx % sample_stride == 0 and self._infer_ring:
-                    clip = self._build_clip(clip_len)
-                    if self._bench:
-                        self._bench.start("inference")
-                    pred = self.model.predict_batch([(self._frame_idx, clip)])[0]
-                    if self._bench:
-                        self._bench.end("inference")
-                    if self._is_trigger(pred):
-                        self._update_cluster(self._frame_idx, half_n)
-                    else:
-                        # No active cluster → update quiet baseline so next burst
-                        # is compared against the current "calm" scene level.
-                        if self._cluster_start is None:
-                            self._quiet_pred = pred
-                    self._last_pred = pred
-
-                # ── Flush cluster ─────────────────────────────────────────────────
-                if self._cluster_start is not None:
-                    cluster_age = self._frame_idx - self._cluster_start
-                    if cluster_age >= frames_per_chunk:
-                        # Cluster reached N seconds → deliver immediately without
-                        # waiting for silence; sustained action produces back-to-back
-                        # N-second chunks with no extra latency.
-                        log.debug(
-                            "cluster max-dur flush  start=%d  age=%d fr",
-                            self._cluster_start, cluster_age,
-                        )
-                        self._flush_cluster(fps, width, height)
-                    elif self._frame_idx > self._cluster_end:
-                        # Normal silence-based flush (half_n frames of inactivity).
-                        self._flush_cluster(fps, width, height)
-
-                self._frame_idx += 1
+                self._step(frame, fps, width, height, half_n, frames_per_chunk,
+                           clip_len, sample_stride, inf_scale, inf_max_side, buf_capacity)
 
         except KeyboardInterrupt:
             log.info("stream stopped  (Ctrl-C)")
         finally:
-            # On exit, flush any open cluster using buffered frames up to now
             if self._cluster_start is not None:
-                log.info(
-                    "exit flush  cluster=[%d, %d]",
-                    self._cluster_start, self._cluster_end,
-                )
+                log.info("exit flush  cluster=[%d, %d]",
+                         self._cluster_start, self._cluster_end)
                 self._flush_cluster(fps, width, height, until=self._frame_idx - 1)
             cap.release()
 
-            # ── Write summary JSON (output_dir or chunks_dir) ─────────────────
+            # ── Summary JSON ───────────────────────────────────────────────────
             _out = getattr(self.opts, "output_dir", None) or getattr(self.opts, "chunks_dir", None)
             if _out:
                 summary = {
@@ -469,6 +555,7 @@ class RTSPStreamProcessor:
                     "url":          self.url,
                     "total_frames": self._frame_idx,
                     "total_chunks": self._chunk_idx,
+                    "view_mode":    _view_mode,
                     "chunks":       self._chunks_meta,
                 }
                 summary_path = Path(str(_out)) / f"{self.opts.run_id}_rtsp_summary.json"
@@ -478,7 +565,7 @@ class RTSPStreamProcessor:
                 except Exception as exc:
                     log.warning("could not write summary JSON: %s", exc)
 
-            # ── Benchmark report ─────────────────────────────────────────────
+            # ── Benchmark report ───────────────────────────────────────────────
             if self._bench and getattr(self.opts, "benchmark_enabled", False):
                 from common.video_io import VideoMeta
                 fake_meta = VideoMeta(
@@ -495,13 +582,15 @@ class RTSPStreamProcessor:
                     self._bench,
                     video_meta=fake_meta,
                     method="rtsp-stream",
-                    selector_model=self.model.__class__.__name__,
+                    selector_model=(
+                        type(self.model).__name__ if self.model else "IRMotionDetector"
+                    ),
                     benchmark_cfg=getattr(self.opts, "benchmark_cfg", {}),
                 )
                 if bench_out:
                     save_benchmark_report(bench_report, bench_out)
                     log.info("benchmark → %s", bench_out)
-                _b = bench_report
+                _b  = bench_report
                 tp  = _b.get("throughput", {}).get("pipeline", {})
                 mem = _b.get("memory", {})
                 dep = _b.get("deployment_recommendation", {})
@@ -522,13 +611,11 @@ class RTSPStreamProcessor:
                 log.info("  Deployment tier    : %s", dep.get("label", "?"))
                 log.info("─────────────────────────────────────────────────────────────────")
 
-        log.info(
-            "stream done  frames=%d  chunks=%d",
-            self._frame_idx, self._chunk_idx,
-        )
+        log.info("stream done  frames=%d  chunks=%d", self._frame_idx, self._chunk_idx)
         return {
             "mode":         "rtsp",
             "url":          self.url,
             "total_frames": self._frame_idx,
             "total_chunks": self._chunk_idx,
+            "view_mode":    _view_mode,
         }

@@ -33,6 +33,8 @@ from common.visualize import AnnotateStyle, write_annotated_video
 from parallel_filter import do_filter
 from correlation_plot import plot_correlation_timeline
 from chunk_exporter import split_and_publish_chunks
+from day_night_detector import detect_view_mode
+from ir_filter import do_ir_filter
 
 
 def _path_or_none(value: str | Path | None) -> Path | None:
@@ -115,6 +117,7 @@ class RunOptions:
     run_id:             str   = "test-run-12345"
     camera_id:          str   = ""
     site_id:            str   = ""
+    app_id:             int   = 0
     chunk_duration_sec: float = 5.0
     chunk_width:        int | None = None
     chunk_height:       int | None = None
@@ -128,6 +131,15 @@ class RunOptions:
     kafka_critic_enabled: str | None = None   # "true"/"false" → metadata.critic_enabled
     kafka_sp:             str | None = None   # alert_level.sp  (None = inherit from sp_enabled)
     kafka_critic:         str | None = None   # alert_level.critic (None = inherit)
+
+    # ── ROI ───────────────────────────────────────────────────────────────────
+    roi_path:               str | None = None   # LabelMe JSON → restrict detection to region
+
+    # ── Day / night mode ──────────────────────────────────────────────────────
+    view_mode:              str   = "auto"   # "auto" | "day" | "night"
+    day_night_sat_threshold: float = 30.0    # HSV mean-saturation threshold
+    day_night_sample_frames: int   = 30      # frames to sample for detection
+    ir_mode_cfg:            dict[str, Any] = field(default_factory=dict)
 
     # ── Model weights ─────────────────────────────────────────────────────────
     model_path:        str | None = None   # local .pt file → no network download
@@ -183,6 +195,16 @@ def options_from_config(cfg: dict[str, Any], video: Path | None = None) -> RunOp
         run_id=cfg.get("run_id", "test-run-12345"),
         camera_id=str(cfg.get("camera_id", "")),
         site_id=str(cfg.get("site_id", "")),
+        app_id=int(cfg.get("app_id", 0)),
+        roi_path=str(cfg["roi_path"]) if cfg.get("roi_path") else None,
+        view_mode=str(cfg.get("view_mode", "auto")),
+        day_night_sat_threshold=float(
+            cfg.get("day_night_detection", {}).get("saturation_threshold", 30.0)
+        ),
+        day_night_sample_frames=int(
+            cfg.get("day_night_detection", {}).get("sample_frames", 30)
+        ),
+        ir_mode_cfg=cfg.get("ir_mode", {}),
         n_workers=int(cfg.get("n_workers", 1)),
         chunk_duration_sec=float(cfg.get("chunk_duration_sec", 5.0)),
         base_timestamp_ms=cfg.get("base_timestamp_ms"),
@@ -326,11 +348,27 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             filtered_out = paths["filtered_clip"]
         filtered_out.parent.mkdir(parents=True, exist_ok=True)
 
+        # ── Detect day / night once before filtering ──────────────────────────
+        view_mode = detect_view_mode(
+            opts.video,
+            saturation_threshold=opts.day_night_sat_threshold,
+            sample_frames=opts.day_night_sample_frames,
+            forced_mode=opts.view_mode,
+        )
+        log.info("view mode: %s  (threshold=%.0f  sample_frames=%d)",
+                 view_mode, opts.day_night_sat_threshold, opts.day_night_sample_frames)
+
         par_tmp = out_dir / "_filter_segs"
         bench.reset_gpu_peak()
         bench.start("filter")
         stage_t0 = time.perf_counter()
-        fi = do_filter(opts.video, opts, opts.n_workers, filtered_out, tmp_dir=par_tmp)
+        if view_mode == "night":
+            log.info("filter   mode=IR  method=%s  sensitivity=%s",
+                     opts.ir_mode_cfg.get("method", "ensemble"),
+                     opts.ir_mode_cfg.get("sensitivity", "medium"))
+            fi = do_ir_filter(opts.video, opts, filtered_out)
+        else:
+            fi = do_filter(opts.video, opts, opts.n_workers, filtered_out, tmp_dir=par_tmp)
         bench.end("filter")
         filter_elapsed = time.perf_counter() - stage_t0
 
@@ -494,6 +532,7 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             site_id=opts.site_id,
             camera_id=opts.camera_id,
             run_id=opts.run_id,
+            app_id=opts.app_id,
             chunk_duration_sec=opts.chunk_duration_sec,
             chunk_width=opts.chunk_width,
             chunk_height=opts.chunk_height,

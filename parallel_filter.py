@@ -119,6 +119,18 @@ def _filter_segment_worker(args: dict) -> dict:
     _lg.getLogger(__name__).info("Starting segment %d: %s", idx, seg_path.name)
     t0 = time.perf_counter()
 
+    # Load ROI mask for this worker (path is picklable; mask is re-created per worker)
+    roi_mask = None
+    roi_path = o.get("roi_path")
+    if roi_path:
+        import cv2 as _cv2
+        _cap = _cv2.VideoCapture(str(seg_path))
+        _fw  = int(_cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+        _fh  = int(_cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+        _cap.release()
+        from roi_loader import load_roi
+        roi_mask = load_roi(roi_path, _fw, _fh).mask
+
     sel = ActionAwareSelector(
         clip_len=o["clip_len"],
         sample_stride=o["sample_stride"],
@@ -135,6 +147,7 @@ def _filter_segment_worker(args: dict) -> dict:
         audio_delta_z=o.get("audio_delta_z", 2.0),
         model_path=o.get("model_path"),
         model_cache_dir=o.get("model_cache_dir"),
+        roi_mask=roi_mask,
     )
     result = sel.select(seg_path)
     elapsed = time.perf_counter() - t0
@@ -174,7 +187,14 @@ def _filter_segment_worker(args: dict) -> dict:
 
 def _sequential(video: Path, opts, output_path: Path) -> dict[str, Any]:
     from selector import ActionAwareSelector
-    from common.video_io import write_kept_video
+    from common.video_io import write_kept_video, read_video_meta
+
+    roi_mask = None
+    roi_path = getattr(opts, "roi_path", None)
+    if roi_path:
+        m = read_video_meta(video)
+        from roi_loader import load_roi
+        roi_mask = load_roi(roi_path, m.width, m.height).mask
 
     sel = ActionAwareSelector(
         clip_len=opts.clip_len,
@@ -192,6 +212,7 @@ def _sequential(video: Path, opts, output_path: Path) -> dict[str, Any]:
         audio_delta_z=getattr(opts, "audio_delta_z", 2.0),
         model_path=getattr(opts, "model_path", None),
         model_cache_dir=getattr(opts, "model_cache_dir", None),
+        roi_mask=roi_mask,
     )
     result = sel.select(video)
     compress = write_kept_video(
@@ -288,6 +309,7 @@ def _parallel(
         "output_fps":        getattr(opts, "output_fps", None),
         "model_path":        getattr(opts, "model_path", None),
         "model_cache_dir":   getattr(opts, "model_cache_dir", None),
+        "roi_path":          getattr(opts, "roi_path", None),
     }
     worker_args = [
         {

@@ -19,6 +19,17 @@
   "run_id": "test-run-12345",
   "camera_id": "cam-001",
   "site_id": "site-001",
+  "app_id": 0,
+  "roi_path": "",
+  "view_mode": "auto",
+  "day_night_detection": {
+    "saturation_threshold": 30,
+    "sample_frames": 30
+  },
+  "ir_mode": {
+    "method": "ensemble",
+    "sensitivity": "medium"
+  },
   "chunk_duration_sec": 5,
   "skip_kafka": false,
   "chunks_dir": "",
