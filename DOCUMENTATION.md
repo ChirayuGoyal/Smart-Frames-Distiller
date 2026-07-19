@@ -1,5 +1,17 @@
 # Action-Aware Video Pipeline — Technical Documentation
 
+> **Note (July 2026 refactor):** the face stack was unified into the `faces/`
+> package. Mapping: `fr_core.py` → `faces/persons.py` (PersonDetector),
+> `faces/engine.py` (SCRFD/ArcFace/align), `faces/tracker.py` (FaceTracker),
+> `faces/store.py` (MilvusFaceStore); `fr_annotate.py`/`face_recognizer.py` →
+> `faces/annotate.py`; `fr_milvus.py` → `faces/store.py`. YuNet and the
+> random-name annotator were removed. Kafka is OFF unless `--kafka true`
+> (there is no `--skip-kafka`). A FastAPI server now lives in `server/`.
+> Sections below may describe the pre-refactor layout; current architecture:
+> `README.md` and `CLAUDE.md`.
+
+
+
 ## Table of Contents
 
 1. [Pipeline Overview](#1-pipeline-overview)
@@ -49,7 +61,7 @@ Input Video
     ▼  --detect true
 ┌─────────────────────────────┐
 │  Stage 2 — Detect           │  YOLOv8n → YuNet/SCRFD → ArcFace →
-│  fr_annotate.py / fr_core   │  Milvus → annotated clip with names
+│  faces/annotate.py / faces/ package   │  Milvus → annotated clip with names
 └─────────────────────────────┘
     │  annotated clip
     ▼  --chunk true
@@ -380,7 +392,7 @@ When `--workers N` (N > 1) is passed and `--device cpu`, the video is split into
 
 ## 3. Stage 2 — Person Detection & Face Recognition
 
-**Entry point:** `fr_annotate.py → annotate_video()`
+**Entry point:** `faces/annotate.py → annotate_video()`
 
 Per-frame pipeline for each person detected:
 
@@ -413,7 +425,7 @@ Stable label drawn on frame
 
 ### Person Detector: YOLOv8n
 
-**File:** `fr_core.py → PersonDetector`
+**File:** `faces/persons.py → PersonDetector`
 
 | Property | Value |
 |---|---|
@@ -431,7 +443,7 @@ Stable label drawn on frame
 
 ### Face Detector: YuNet (default)
 
-**File:** `fr_core.py → YuNetDetector`
+**File:** `faces/ package → YuNetDetector`
 
 | Property | Value |
 |---|---|
@@ -450,7 +462,7 @@ Preferred for its robustness across all ages (toddlers to elderly).
 
 ### Face Detector: SCRFD det_10g (alternative)
 
-**File:** `fr_core.py → FaceDetector`
+**File:** `faces/engine.py → SCRFD`
 
 Set `detector_type: "scrfd"` in config to use this instead of YuNet.
 
@@ -470,7 +482,7 @@ Set `detector_type: "scrfd"` in config to use this instead of YuNet.
 
 ### Face Alignment: Procrustes
 
-**File:** `fr_core.py → align_face()`
+**File:** `faces/engine.py → align_face()`
 
 Aligns detected face keypoints to a 112×112 canonical coordinate system used by ArcFace.
 
@@ -502,7 +514,7 @@ After alignment, a soft ellipse mask is applied (`preprocess_face`) to suppress 
 
 ### Face Embedder: ArcFace R50
 
-**File:** `fr_core.py → FaceEmbedder`
+**File:** `faces/engine.py → ArcFace`
 
 | Property | Value |
 |---|---|
@@ -518,12 +530,12 @@ The resulting vector is a point on the 512-d unit hypersphere. Angular distance 
 
 ### Face Registry: Milvus
 
-**File:** `fr_core.py → FaceDB`
+**File:** `faces/store.py → MilvusFaceStore`
 
 | Property | Value |
 |---|---|
 | Backend | Milvus vector database |
-| Host | `10.178.120.159:19530` (from config) |
+| Host | `localhost:19530` (from config) |
 | Collection | `face_registry` |
 | Index type | `FLAT` (exact, no approximation) |
 | Metric | `COSINE` similarity |
@@ -546,7 +558,7 @@ The resulting vector is a point on the 512-d unit hypersphere. Angular distance 
 
 ### IoU Tracker
 
-**File:** `fr_core.py → IoUTracker`
+**File:** `faces/tracker.py → FaceTracker`
 
 Temporally smooths face recognition labels across frames so a person's name doesn't flicker when face detection is skipped or fails.
 
@@ -646,7 +658,7 @@ One message is published per chunk to topic `semantic-chunks-data`:
   "end_timestamp": 1750000010000,
   "metadata": {
     "chunk_format": "mp4",
-    "path": "/jvadata/vst/assets/site-001/cam-001/4a8df726-....mp4",
+    "path": "<assets_base>/site-001/cam-001/4a8df726-....mp4",
     "sp_enabled": "true",
     "critic_enabled": "true",
     "alert_level": {
@@ -664,8 +676,8 @@ One message is published per chunk to topic `semantic-chunks-data`:
     "end_timestamp": 1750000010000,
     "source_fps": 25.0,
     "frame_count": 250,
-    "frames_sidecar": "/jvadata/vst/assets/site-001/cam-001/4a8df726-....frames.json",
-    "frames_metadata_file": "/jvadata/vst/assets/site-001/cam-001/full/<run_id>_frames_metadata.json",
+    "frames_sidecar": "<assets_base>/site-001/cam-001/4a8df726-....frames.json",
+    "frames_metadata_file": "<assets_base>/site-001/cam-001/full/<run_id>_frames_metadata.json",
     "frames": [ ... ]
   }
 }
@@ -686,16 +698,16 @@ One message is published per chunk to topic `semantic-chunks-data`:
 
 | File | Path |
 |---|---|
-| Filtered clip | `/jvadata/vst/assets/<site>/<camera>/<run_id>.mp4` |
-| Filter metadata | `/jvadata/vst/assets/<site>/<camera>/<run_id>_metadata.json` |
-| Chunk video | `/jvadata/vst/assets/<site>/<camera>/<chunk_id>.mp4` |
-| Chunk sidecar | `/jvadata/vst/assets/<site>/<camera>/<chunk_id>.frames.json` |
-| Run frames metadata | `/jvadata/vst/assets/<site>/<camera>/full/<run_id>_frames_metadata.json` |
+| Filtered clip | `<assets_base>/<site>/<camera>/<run_id>.mp4` |
+| Filter metadata | `<assets_base>/<site>/<camera>/<run_id>_metadata.json` |
+| Chunk video | `<assets_base>/<site>/<camera>/<chunk_id>.mp4` |
+| Chunk sidecar | `<assets_base>/<site>/<camera>/<chunk_id>.frames.json` |
+| Run frames metadata | `<assets_base>/<site>/<camera>/full/<run_id>_frames_metadata.json` |
 | Local output dir | `<video_dir>/action_aware_output/` |
 | Kafka debug log | `output/kafka_debug.log` |
 | Kafka pending spool | `output/kafka_pending.jsonl` (when broker unreachable) |
 
-All paths use `assets_base` from `config.json → kafka.assets_base` (default `/jvadata/vst/assets`).
+All paths use `assets_base` from `config.json → kafka.assets_base` (default `<assets_base>`).
 
 ---
 
@@ -771,9 +783,9 @@ After a full pipeline run (`--filter --detect --chunk --kafka`) the following fi
 
   "kafka": {
     "enabled": true,
-    "brokers": "10.178.120.135:9092",
+    "brokers": "localhost:9092",
     "topic": "semantic-chunks-data",
-    "assets_base": "/jvadata/vst/assets",
+    "assets_base": "<assets_base>",
     "sp_enabled": "true",        // smart-processor flag in message
     "critic_enabled": "true",    // critic flag in message
     "embed_frame_metadata": true // embed full frames array in Kafka message
@@ -964,7 +976,7 @@ Same as chunk mode in file pipeline:
 
 1. `--chunks-dir PATH` — write chunks here
 2. `--out-dir PATH` — write chunks here (if `--chunks-dir` not set)
-3. `/jvadata/vst/assets/<site_id>/<camera_id>/<chunk_id>.mp4` — kafka asset path (default)
+3. `<assets_base>/<site_id>/<camera_id>/<chunk_id>.mp4` — kafka asset path (default)
 
 ### Configuration
 
