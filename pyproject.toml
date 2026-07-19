@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-frames-distiller"
+version = "0.2.0"
+description = "Action-aware video distillation pipeline with FastAPI server"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.setuptools]
+packages = ["common", "faces", "server", "server.routers"]
+py-modules = [
+    "action_model",
+    "audio_filter",
+    "benchmark",
+    "chunk_exporter",
+    "correlation_plot",
+    "fr_discover",
+    "fr_ingest",
+    "fr_inspect",
+    "fr_merge",
+    "fr_onboard",
+    "fr_tag",
+    "kafka_producer",
+    "main",
+    "parallel_filter",
+    "preprocess",
+    "rtsp_stream",
+    "runner",
+    "selector",
+    "validate",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs ONNX models / external services",
+    "gpu: needs CUDA",
+    "ffmpeg: needs ffmpeg on PATH",
+]
