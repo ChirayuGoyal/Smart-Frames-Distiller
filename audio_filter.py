@@ -67,17 +67,20 @@ def _rms_per_frame(
     fps: float,
     n_frames: int,
 ) -> np.ndarray:
-    """Compute RMS energy per video frame, one bucket per frame."""
-    hop = max(1, int(sr / fps))
+    """Compute RMS energy per video frame, one bucket per frame.
+
+    Bucket boundaries use round(sr * i / fps) rather than a fixed integer hop —
+    a truncated hop drifts off the true frame times over long clips.
+    """
     rms = np.empty(n_frames, dtype=np.float32)
     for i in range(n_frames):
-        s = i * hop
-        e = min(s + hop, len(audio))
-        if s >= len(audio):
+        s = int(round(sr * i / fps))
+        e = min(int(round(sr * (i + 1) / fps)), len(audio))
+        if s >= len(audio) or e <= s:
             rms[i] = 0.0
         else:
             w = audio[s:e]
-            rms[i] = float(np.sqrt(np.mean(w * w))) if len(w) > 0 else 0.0
+            rms[i] = float(np.sqrt(np.mean(w * w)))
     return rms
 
 

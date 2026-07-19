@@ -41,7 +41,12 @@ _MIN_SEG_SEC = 15.0   # don't create segments shorter than this
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
 def _ffmpeg_split(video: Path, start_sec: float, duration_sec: float, dst: Path) -> None:
-    """Extract one time segment via stream-copy (no re-encode — very fast)."""
+    """Extract one time segment, frame-accurately.
+
+    Re-encodes (libx264 ultrafast) instead of stream-copying: -c copy cuts on
+    keyframes, so segment frame counts don't sum to the source total and every
+    downstream kept-index offset drifts. The encode cost buys exact indices.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
         [
@@ -49,10 +54,11 @@ def _ffmpeg_split(video: Path, start_sec: float, duration_sec: float, dst: Path)
             "-ss", f"{start_sec:.6f}",
             "-i", str(video),
             "-t", f"{duration_sec:.6f}",
-            "-c", "copy",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-c:a", "copy",
             str(dst),
         ],
-        capture_output=True, timeout=300,
+        capture_output=True, timeout=600,
     )
     if r.returncode != 0:
         raise RuntimeError(
@@ -65,8 +71,13 @@ def _ffmpeg_concat(clips: list[Path], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     lst = output.with_suffix(".concat_list.txt")
     try:
+        # concat-demuxer quoting: single quotes in the path are escaped as '\''
+        # and paths use forward slashes so Windows backslashes survive.
         lst.write_text(
-            "\n".join(f"file '{p.resolve()}'" for p in clips),
+            "\n".join(
+                "file '{}'".format(p.resolve().as_posix().replace("'", "'\\''"))
+                for p in clips
+            ),
             encoding="utf-8",
         )
         r = subprocess.run(
@@ -192,6 +203,9 @@ def _sequential(video: Path, opts, output_path: Path) -> dict[str, Any]:
         audio_delta_z=getattr(opts, "audio_delta_z", 2.0),
         model_path=getattr(opts, "model_path", None),
         model_cache_dir=getattr(opts, "model_cache_dir", None),
+        model=getattr(opts, "action_model", None),
+        progress_cb=getattr(opts, "filter_progress_cb", None),
+        cancel_check=getattr(opts, "filter_cancel_check", None),
     )
     result = sel.select(video)
     compress = write_kept_video(
@@ -265,9 +279,8 @@ def _parallel(
 
     # ── Build worker args ─────────────────────────────────────────────────────
     here     = str(Path(__file__).resolve().parent)
-    root     = str(Path(__file__).resolve().parents[1])
-    # Preserve existing sys.path entries + prepend project roots
-    sys_paths = list(dict.fromkeys([here, root] + sys.path))
+    # Preserve existing sys.path entries + prepend repo root (Windows spawn needs it)
+    sys_paths = list(dict.fromkeys([here] + sys.path))
 
     opts_dict: dict[str, Any] = {
         "clip_len":          opts.clip_len,
@@ -341,7 +354,9 @@ def _parallel(
     if not filtered_clips:
         raise RuntimeError("All segments produced 0 kept frames — nothing to output.")
 
-    # ── Approximate global kept_indices ───────────────────────────────────────
+    # ── Global kept_indices ───────────────────────────────────────────────────
+    # Exact: _ffmpeg_split is frame-accurate (re-encode), so per-segment decoded
+    # totals sum to the source total and local→global offsets are precise.
     global_kept: list[int] = []
     frame_offset = 0
     for r in seg_results:
@@ -420,6 +435,11 @@ def do_filter(
 
     Returns a FilterInfo dict with all fields runner.py needs.
     """
+    if n_workers > 1:
+        if getattr(opts, "cancel_event", None) is not None:
+            log.info("Server cancellation requires sequential filtering; using one worker")
+            n_workers = 1
+
     if n_workers > 1:
         # Each worker spawns its own CUDA context and loads R3D-18 into VRAM
         # independently. On a shared GPU this exhausts VRAM very quickly.

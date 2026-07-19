@@ -35,9 +35,6 @@ from typing import Any
 import cv2
 import numpy as np
 
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT))
-
 from common.benchmark import (
     BenchmarkSession,
     build_benchmark_report,
@@ -46,14 +43,17 @@ from common.benchmark import (
 from action_model import create_action_model, ActionPrediction
 from preprocess import resize_for_inference
 from kafka_producer import (
+    KafkaPublisher,
     build_chunk_message,
     chunk_asset_path,
-    connect_kafka,
     kafka_settings,
-    publish_chunk,
 )
 
 log = logging.getLogger(__name__)
+
+
+class StreamConnectionError(RuntimeError):
+    """RTSP source could not be (re)opened within the reconnect budget."""
 
 
 def _reencode_chunk(src: Path, dst: Path, fps: float | None = None) -> bool:
@@ -115,10 +115,24 @@ class RTSPStreamProcessor:
         opts,                                   # RunOptions
         *,
         kafka_overrides: dict[str, Any] | None = None,
+        stop_event: Any = None,                 # threading.Event | None
+        publisher: KafkaPublisher | None = None,
+        max_reconnects: int = 10,
+        reconnect_backoff_base: float = 2.0,
     ) -> None:
         self.url             = rtsp_url
-        self.opts            = opts
+        if isinstance(opts, dict) or opts is None:
+            from runner import options_from_config
+            from pathlib import Path
+            self.opts = options_from_config(opts or {}, video=Path(rtsp_url))
+        else:
+            self.opts = opts
+        opts = self.opts
         self.kafka_overrides = kafka_overrides or {}
+        self.stop_event      = stop_event
+        self.max_reconnects  = max_reconnects
+        self.reconnect_backoff_base = reconnect_backoff_base
+        self._stopped_reason: str = ""
 
         self.model = create_action_model(
             clip_len=getattr(opts, "clip_len",         16),
@@ -147,6 +161,7 @@ class RTSPStreamProcessor:
         self._frame_idx:  int = 0
         self._base_ts:    int = int(time.time() * 1000)
         self._cfg         = kafka_settings(self.kafka_overrides)
+        self._publisher   = publisher or KafkaPublisher(self._cfg)
         self._chunks_meta: list[dict] = []   # accumulated per-chunk metadata
         self._bench: BenchmarkSession | None = (
             BenchmarkSession() if getattr(opts, "benchmark_enabled", False) else None
@@ -240,14 +255,16 @@ class RTSPStreamProcessor:
             writer  = cv2.VideoWriter(
                 str(cv_dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h),
             )
-            if not writer.isOpened():
-                log.error("chunk %d: cannot open writer → %s", self._chunk_idx, cv_dst)
-                return
-            for f in frames:
-                if out_w != src_w or out_h != src_h:
-                    f = cv2.resize(f, (out_w, out_h))
-                writer.write(f)
-            writer.release()
+            try:
+                if not writer.isOpened():
+                    log.error("chunk %d: cannot open writer → %s", self._chunk_idx, cv_dst)
+                    return
+                for f in frames:
+                    if out_w != src_w or out_h != src_h:
+                        f = cv2.resize(f, (out_w, out_h))
+                    writer.write(f)
+            finally:
+                writer.release()
             out_fps = getattr(opts, "output_fps", None) or fps
             if self._bench:
                 self._bench.start("chunk_write")
@@ -308,7 +325,7 @@ class RTSPStreamProcessor:
                 sp=cfg.get("sp"),
                 critic=cfg.get("critic"),
             )
-            publish_chunk(msg, cfg=cfg)
+            self._publisher.publish(msg)
 
         log.info(
             "chunk %d  frames=%d  dur=%.1fs  window=[%d,%d]  → %s",
@@ -356,15 +373,28 @@ class RTSPStreamProcessor:
 
     # ── main loop ─────────────────────────────────────────────────────────────────
 
+    def stats(self) -> dict[str, Any]:
+        """Live counters for external status surfaces (thread-safe reads of ints)."""
+        return {
+            "url":            self.url,
+            "total_frames":   self._frame_idx,
+            "total_chunks":   self._chunk_idx,
+            "cluster_open":   self._cluster_start is not None,
+            "stopped_reason": self._stopped_reason,
+        }
+
+    def _should_stop(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
     def run(self) -> dict[str, Any]:
         """
-        Read stream until KeyboardInterrupt.
-        Returns summary: total_frames, total_chunks.
+        Read stream until stop_event is set (or KeyboardInterrupt in CLI use).
+        Returns summary: total_frames, total_chunks, chunks_meta, stopped_reason.
         """
         log.info("stream start  url=%s", self.url)
 
         if self._cfg.get("enabled"):
-            connect_kafka(wait=True, overrides=self.kafka_overrides)
+            self._publisher.connect(wait=True)
 
         cap = self._open()
         if not cap.isOpened():
@@ -396,15 +426,41 @@ class RTSPStreamProcessor:
             opts.chunk_duration_sec, half_n, buf_capacity,
         )
 
+        reconnects = 0
         try:
             while True:
+                if self._should_stop():
+                    self._stopped_reason = "stop_event"
+                    log.info("stream stopped  (stop_event set)")
+                    break
                 ok, frame = cap.read()
                 if not ok:
-                    log.warning("stream drop — reconnecting in 2s")
+                    reconnects += 1
+                    if reconnects > self.max_reconnects:
+                        self._stopped_reason = "reconnects_exhausted"
+                        raise StreamConnectionError(
+                            f"stream lost and {self.max_reconnects} reconnect "
+                            f"attempts failed: {self.url}"
+                        )
+                    delay = min(
+                        60.0, self.reconnect_backoff_base * (2 ** (reconnects - 1))
+                    )
+                    log.warning(
+                        "stream drop — reconnect %d/%d in %.1fs",
+                        reconnects, self.max_reconnects, delay,
+                    )
                     cap.release()
-                    time.sleep(2)
+                    # Sleep in short slices so stop_event stays responsive.
+                    t_end = time.monotonic() + delay
+                    while time.monotonic() < t_end:
+                        if self._should_stop():
+                            break
+                        time.sleep(min(0.25, max(0.0, t_end - time.monotonic())))
+                    if self._should_stop():
+                        continue
                     cap = self._open()
                     continue
+                reconnects = 0  # healthy read resets the budget
 
                 # ── Buffer ALL frames (for cluster extraction) ──────────────────
                 self._frame_buf.append((self._frame_idx, frame.copy()))
@@ -450,6 +506,7 @@ class RTSPStreamProcessor:
                 self._frame_idx += 1
 
         except KeyboardInterrupt:
+            self._stopped_reason = "keyboard_interrupt"
             log.info("stream stopped  (Ctrl-C)")
         finally:
             # On exit, flush any open cluster using buffered frames up to now
@@ -527,8 +584,10 @@ class RTSPStreamProcessor:
             self._frame_idx, self._chunk_idx,
         )
         return {
-            "mode":         "rtsp",
-            "url":          self.url,
-            "total_frames": self._frame_idx,
-            "total_chunks": self._chunk_idx,
+            "mode":           "rtsp",
+            "url":            self.url,
+            "total_frames":   self._frame_idx,
+            "total_chunks":   self._chunk_idx,
+            "chunks_meta":    self._chunks_meta,
+            "stopped_reason": self._stopped_reason or "eof",
         }

@@ -124,16 +124,16 @@ def main() -> int:
                      help="Max gap between kept segments in frames  (default 30)")
     flt.add_argument("--device",         choices=["auto", "cpu", "cuda"], default=None,
                      help="Inference device  (default auto)")
-    flt.add_argument("--workers",        type=int,   default=1, metavar="N",
+    flt.add_argument("--workers",        type=int,   default=None, metavar="N",
                      help="Parallel filter workers — split video into N segments and filter "
-                          "each in a separate process (default 1 = sequential). "
+                          "each in a separate process (default: config n_workers or 1). "
                           "Try 4 for long clips on a multi-core server.")
     flt.add_argument("--no-torch",       action="store_true",
                      help="Use motion-energy fallback instead of R3D-18")
     flt.add_argument("--ensemble",        action="store_true",
                      help="Run R3D-18 AND MotionEnergy together — keep frames "
                           "flagged by either model (OR-logic triggers)")
-    flt.add_argument("--audio-spikes",   type=_bool, default=False, metavar="true|false",
+    flt.add_argument("--audio-spikes",   type=_bool, default=None, metavar="true|false",
                      help="Keep frames near audio energy spikes "
                           "(loud events + sudden energy transitions)")
     flt.add_argument("--audio-rms-z",    type=float, default=None, metavar="FLOAT",
@@ -242,8 +242,9 @@ def main() -> int:
     opts.filtered_clip     = args.filtered_clip
     opts.detection_clip    = args.detection_clip
     opts.output_clip       = args.output_clip
-    opts.benchmark_enabled = args.benchmark
-    opts.save_benchmark    = args.benchmark
+    # --benchmark-out implies benchmarking (its help says so)
+    opts.benchmark_enabled = args.benchmark or args.benchmark_out is not None
+    opts.save_benchmark    = args.benchmark or args.benchmark_out is not None
     opts.benchmark_path    = args.benchmark_out
 
     # Stage flags
@@ -260,7 +261,9 @@ def main() -> int:
     if args.run:    opts.run_id             = args.run
 
     # Filter
-    opts.n_workers = max(1, args.workers)
+    # Only override config when the flag was actually passed
+    if args.workers is not None:
+        opts.n_workers = max(1, args.workers)
     if args.width:       opts.output_width        = args.width
     if args.height:      opts.output_height       = args.height
     if args.fps:         opts.output_fps          = args.fps
@@ -271,7 +274,8 @@ def main() -> int:
     if args.device:      opts.device              = args.device
     if args.no_torch:    opts.prefer_torch        = False
     if args.ensemble:       opts.ensemble            = True
-    opts.audio_spikes = args.audio_spikes
+    if args.audio_spikes is not None:
+        opts.audio_spikes = args.audio_spikes
     if args.audio_rms_z   is not None: opts.audio_rms_z   = args.audio_rms_z
     if args.audio_delta_z is not None: opts.audio_delta_z = args.audio_delta_z
     if args.max_side:    opts.inference_max_side  = args.max_side

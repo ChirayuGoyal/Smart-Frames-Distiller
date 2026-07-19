@@ -18,12 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import sys
-
 log = logging.getLogger(__name__)
-
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT))
 
 from common.benchmark import BenchmarkSession, merge_benchmark_into_report
 from common.selection import build_frame_reasons, removed_indices
@@ -102,7 +97,7 @@ class RunOptions:
     reencode_h264:     bool  = True
     output_width:      int   = 640
     output_height:     int   = 480
-    output_fps:        float = 10.0   # default 10 fps; override with --fps
+    output_fps:        float | None = None   # None = same as input; override with --fps
     plot_correlation:  bool  = False
     correlation_plot_path: Path | None = None
     correlation_show:  bool  = False
@@ -132,12 +127,28 @@ class RunOptions:
     # ── Model weights ─────────────────────────────────────────────────────────
     model_path:        str | None = None   # local .pt file → no network download
     model_cache_dir:   str | None = None   # redirect torch hub download location
+    action_model:      Any = None
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
     benchmark_enabled: bool = False
     benchmark_cfg:     dict[str, Any] = field(default_factory=dict)
     save_benchmark:    bool = False        # write <stem>_benchmark.json
     benchmark_path:    Path | None = None  # override save path
+
+    # ── Server hooks ──────────────────────────────────────────────────────────
+    overwrite:         bool = False        # allow overwriting an existing run's outputs
+    progress_cb:       Any = None          # Callable[[str, float, str], None] | None
+    cancel_event:      Any = None          # threading.Event | None
+    filter_progress_cb: Any = None
+    filter_cancel_check: Any = None
+
+
+class RunExistsError(FileExistsError):
+    """A run with this run_id already produced outputs in the target directory."""
+
+
+class JobCancelled(RuntimeError):
+    """Raised when cancel_event is set during a pipeline run."""
 
 
 def style_from_config(viz: dict[str, Any]) -> AnnotateStyle:
@@ -177,7 +188,7 @@ def options_from_config(cfg: dict[str, Any], video: Path | None = None) -> RunOp
         reencode_h264=cfg.get("reencode_h264", True),
         output_width=out_w,
         output_height=out_h,
-        output_fps=float(cfg.get("output_fps") or 10.0),
+        output_fps=(float(cfg["output_fps"]) if cfg.get("output_fps") else None),
         plot_correlation=cfg.get("plot_correlation", False),
         chunks_dir=(cfg.get("chunks_dir") or None),
         run_id=cfg.get("run_id", "test-run-12345"),
@@ -268,8 +279,20 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             "correlation_plot_path": opts.output_dir / f"{stem}_correlation.png",
             "frames_metadata_path":  opts.output_dir / f"{stem}_frames_metadata.json",
         }
+    if paths["report_path"].exists() and not opts.overwrite:
+        raise RunExistsError(
+            f"Outputs for run '{opts.run_id}' already exist at "
+            f"{paths['report_path']} — pass overwrite=True (or use a fresh run_id)."
+        )
+
     out_dir = paths["output_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _tick(stage: str, frac: float, message: str = "") -> None:
+        if opts.cancel_event is not None and opts.cancel_event.is_set():
+            raise JobCancelled(f"cancelled during stage '{stage}'")
+        if opts.progress_cb is not None:
+            opts.progress_cb(stage, frac, message)
 
     bench        = BenchmarkSession()
     meta         = read_video_meta(opts.video)
@@ -308,8 +331,11 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
     stage_num  = 0
 
     # ── Stage 1: Filtering ────────────────────────────────────────────────────
+    filter_kept_indices: list[int] | None = None
+
     if opts.filter_enabled:
         stage_num += 1
+        _tick("filter", 0.0, "starting filter")
         _hdr(f"[{stage_num}/{n_active}] filter")
         log.info("config   device=%s  workers=%d  stride=%d  clip_len=%d",
                  opts.device, opts.n_workers, opts.sample_stride, opts.clip_len)
@@ -319,8 +345,9 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
         elif opts.output_dir:
             filtered_out = paths["filtered_clip"]   # already under out_dir
         elif opts.run_id and opts.site_id and opts.camera_id:
-            filtered_out = Path(
-                f"/jvadata/vst/assets/{opts.site_id}/{opts.camera_id}/{opts.run_id}.mp4"
+            assets_base = opts.kafka_cfg.get("assets_base", "assets")
+            filtered_out = (
+                Path(assets_base) / opts.site_id / opts.camera_id / f"{opts.run_id}.mp4"
             )
         else:
             filtered_out = paths["filtered_clip"]
@@ -330,6 +357,19 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
         bench.reset_gpu_peak()
         bench.start("filter")
         stage_t0 = time.perf_counter()
+        def _filter_progress(done: int, total: int) -> None:
+            frac = done / total if total else 0.0
+            _tick("filter", frac, f"filtering frame {done}/{total}")
+
+        def _filter_cancel_check() -> None:
+            # Cancel-only: must NOT call progress_cb — the selector invokes this
+            # every frame, and a progress write per frame hammers the job store
+            # and stomps the real progress fraction.
+            if opts.cancel_event is not None and opts.cancel_event.is_set():
+                raise JobCancelled("cancelled during stage 'filter'")
+
+        opts.filter_progress_cb = _filter_progress
+        opts.filter_cancel_check = _filter_cancel_check
         fi = do_filter(opts.video, opts, opts.n_workers, filtered_out, tmp_dir=par_tmp)
         bench.end("filter")
         filter_elapsed = time.perf_counter() - stage_t0
@@ -342,6 +382,7 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
         # ── Filter metadata JSON ──────────────────────────────────────────────
         total_f  = fi["total_frames"]
         kept_idx = fi["kept_indices"]
+        filter_kept_indices = kept_idx
         drop_idx = sorted(set(range(total_f)) - set(kept_idx))
 
         filter_meta = {
@@ -370,8 +411,10 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
         if opts.output_dir:
             filter_meta_path = paths["filter_metadata"]   # already under out_dir
         elif opts.run_id and opts.site_id and opts.camera_id:
-            filter_meta_path = Path(
-                f"/jvadata/vst/assets/{opts.site_id}/{opts.camera_id}/{opts.run_id}_metadata.json"
+            assets_base = opts.kafka_cfg.get("assets_base", "assets")
+            filter_meta_path = (
+                Path(assets_base) / opts.site_id / opts.camera_id
+                / f"{opts.run_id}_metadata.json"
             )
         else:
             filter_meta_path = paths["filter_metadata"]
@@ -414,29 +457,35 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             device=fi["device"],
         )
         log.info("filter   output → %s", filtered_out)
+        _tick("filter", 1.0, "filter complete")
 
     # ── Stage 2: Detection ────────────────────────────────────────────────────
     if opts.detection_enabled:
         stage_num += 1
+        _tick("detection", 0.0, "starting detection")
         _hdr(f"[{stage_num}/{n_active}] detect")
         fr_cfg = opts.face_recognition_cfg
         log.info("config   site=%s  frame_skip=%d  sim_thresh=%.2f",
                  fr_cfg.get("site_id", ""), fr_cfg.get("frame_skip", "?"),
-                 fr_cfg.get("similarity_threshold", 0.45))
+                 fr_cfg.get("similarity_thresh") or fr_cfg.get("similarity_threshold", 0.45))
 
         if not current_clip.is_file():
             raise FileNotFoundError(
                 f"Detection stage: input clip not found: {current_clip}\n"
                 "Run --filter first or point to an existing clip."
             )
-        from fr_annotate import annotate_video
+        from faces.annotate import annotate_video
         detection_out = opts.detection_clip or paths["detection_clip"]
+        def _detection_progress(stage: str, frac: float, message: str) -> None:
+            _tick(stage, frac, message)
+
         bench.start("detection")
         stage_t0 = time.perf_counter()
         det_info = annotate_video(
             str(current_clip),
             str(detection_out),
             opts.face_recognition_cfg,
+            progress_cb=_detection_progress,
         )
         bench.end("detection")
         det_elapsed = time.perf_counter() - stage_t0
@@ -451,10 +500,12 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             recognised=det_info.get("recognised_draws", "?"),
             unknown=det_info.get("unknown_draws", "?"),
         )
+        _tick("detection", 1.0, "detection complete")
 
     # ── Stage 3: Chunking ─────────────────────────────────────────────────────
     if opts.chunk_enabled:
         stage_num += 1
+        _tick("chunk", 0.0, "starting chunking")
         _hdr(f"[{stage_num}/{n_active}] chunk")
         log.info("config   duration=%.0fs  kafka=%s  site=%s  camera=%s  run=%s",
                  opts.chunk_duration_sec, opts.kafka_enabled,
@@ -489,6 +540,10 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
 
         bench.start("chunk")
         stage_t0 = time.perf_counter()
+        def _chunk_progress(done: int, total: int) -> None:
+            frac = done / total if total else 0.0
+            _tick("chunk", frac, f"chunking frame {done}/{total}")
+
         chunk_report = split_and_publish_chunks(
             current_clip,
             site_id=opts.site_id,
@@ -502,10 +557,14 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             reencode_h264=opts.reencode_h264,
             full_clip_dest=opts.full_clip_dest,
             chunks_dir=opts.chunks_dir,
-            kept_indices=None,
+            # Detection stage is frame-preserving, so filter's kept indices stay
+            # valid through stage 2 → correct source_frame_number in sidecars.
+            kept_indices=filter_kept_indices,
             source_fps=meta.fps,
             frames_meta_path=str(frames_meta_path),
             kafka_overrides=kafka_overrides,
+            progress_cb=_chunk_progress,
+            cancel_check=lambda: _tick("chunk", 0.0, "cancellation check"),
         )
         bench.end("chunk")
         chunk_elapsed = time.perf_counter() - stage_t0
@@ -516,6 +575,7 @@ def run_action_aware(opts: RunOptions) -> dict[str, Any]:
             published=chunk_report.get("published_chunks", "?"),
             failed=chunk_report.get("failed_chunks", "?"),
         )
+        _tick("chunk", 1.0, "chunking complete")
 
     # ── Optional output clip copy ─────────────────────────────────────────────
     if opts.output_clip and current_clip.is_file():
