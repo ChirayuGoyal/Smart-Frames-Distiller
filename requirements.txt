@@ -32,6 +32,17 @@ psutil>=5.9                 # RAM / CPU sampling in benchmarks
 matplotlib>=3.7             # correlation timeline plot
 tqdm>=4.64                  # progress bars
 
+# ── Server layer (FastAPI / Uvicorn) ──────────────────────────────────────────
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.7
+pydantic-settings>=2.2
+python-multipart>=0.0.9
+
+# ── Testing & development ─────────────────────────────────────────────────────
+pytest>=8.0
+httpx>=0.27
+
 # ── System dependency (not a Python package) ──────────────────────────────────
 # ffmpeg >= 4.4   required for web-compatible H.264 output (-movflags +faststart)
 #   Ubuntu/Debian: sudo apt install ffmpeg
