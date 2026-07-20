@@ -19,17 +19,6 @@
   "run_id": "test-run-12345",
   "camera_id": "cam-001",
   "site_id": "site-001",
-  "app_id": 0,
-  "roi_path": "",
-  "view_mode": "auto",
-  "day_night_detection": {
-    "saturation_threshold": 30,
-    "sample_frames": 30
-  },
-  "ir_mode": {
-    "method": "ensemble",
-    "sensitivity": "medium"
-  },
   "chunk_duration_sec": 5,
   "chunks_dir": "",
   "description": "Pipeline defaults - set input_video or pass a path on the CLI. Kafka publishes only when --kafka true is passed (kafka.enabled gates the chunk stage's publishing). chunks_dir (or --chunks-dir DIR) saves N-second UUID-named chunks to a folder, independent of Kafka. Chunk length = chunk_duration_sec (or --duration). --save-clip PATH copies the whole filtered clip to an exact path. kafka.debug enables librdkafka internal logging (set to '' to silence). Server deployments configure infra via SFD_* env vars, not this file.",

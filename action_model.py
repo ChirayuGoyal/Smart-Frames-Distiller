@@ -85,10 +85,8 @@ class TorchvisionActionModel(ActionModelBackend):
             # Fast path: load from project-local cache — no network access
             log.info("loading R3D-18 from local cache: %s", local_cache)
             self.model = r3d_18()
-            try:
-                state = torch.load(local_cache, map_location="cpu", weights_only=True)
-            except TypeError:
-                state = torch.load(local_cache, map_location="cpu")
+            # weights_only=True: never unpickle arbitrary objects from the cache
+            state = torch.load(local_cache, map_location="cpu", weights_only=True)
             self.model.load_state_dict(state)
             self.model = self.model.to(self.device).eval()
         else:
@@ -262,6 +260,7 @@ def create_action_model(
     ensemble: bool = False,
     model_path: str | None = None,
     cache_dir: str | None = None,
+    require_torch: bool = False,
 ) -> ActionModelBackend:
     resolved = resolve_device(device)
     if prefer_torch and _TORCH_AVAILABLE:
@@ -276,5 +275,11 @@ def create_action_model(
                 model_path=model_path, cache_dir=cache_dir,
             )
         except Exception:
-            pass
+            if require_torch:
+                raise
+            log.exception(
+                "R3D-18 model load failed — falling back to MotionEnergyActionModel"
+            )
+    elif prefer_torch and require_torch:
+        raise RuntimeError("torch/torchvision not available but require_torch=True")
     return MotionEnergyActionModel()

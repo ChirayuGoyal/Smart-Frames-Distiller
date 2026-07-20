@@ -128,3 +128,11 @@ push_to_remote.bat
 _shell_test.txt
 _git_out.txt
 _push_log.txt
+
+# Generated / runtime (server + tests)
+sfd_data/
+test_data/
+assets/
+models/
+output/
+.omc/

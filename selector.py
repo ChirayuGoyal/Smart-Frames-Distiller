@@ -17,6 +17,7 @@ import logging
 import time
 from collections import deque
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -32,9 +33,6 @@ from action_model import ActionModelBackend, ActionPrediction, create_action_mod
 from correlation_plot import build_correlation_timeline
 from preprocess import resize_for_inference
 
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common.types import DetectedEvent, FrameSelectionResult, SelectionStats
 from common.video_io import iter_frames, read_video_meta
 
@@ -63,6 +61,8 @@ class ActionAwareSelector:
         audio_delta_z: float = 2.0,
         model_path: str | None = None,
         model_cache_dir: str | None = None,
+        progress_cb: Callable[[int, int], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
         roi_mask: np.ndarray | None = None,   # uint8 mask (h,w); 255=inside ROI
     ):
         self.clip_len = clip_len
@@ -77,6 +77,8 @@ class ActionAwareSelector:
         self.audio_spikes  = audio_spikes
         self.audio_rms_z   = audio_rms_z
         self.audio_delta_z = audio_delta_z
+        self.progress_cb = progress_cb
+        self.cancel_check = cancel_check
         self.roi_mask      = roi_mask
         self.model = model or create_action_model(
             clip_len=clip_len, prefer_torch=prefer_torch, device=self.device,
@@ -119,6 +121,8 @@ class ActionAwareSelector:
 
         def _flush() -> None:
             if pending:
+                if self.cancel_check:
+                    self.cancel_check()
                 predictions.extend(self.model.predict_batch(pending))
                 pending.clear()
 
@@ -131,6 +135,8 @@ class ActionAwareSelector:
                 dynamic_ncols=True, leave=True,
             )
         for frame_idx, frame in _frame_iter:
+            if self.cancel_check:
+                self.cancel_check()
             inf_frame = frame
             if self.roi_mask is not None:
                 from roi_loader import apply_roi_mask
@@ -147,6 +153,8 @@ class ActionAwareSelector:
                     _flush()
 
             n = frame_idx + 1
+            if self.progress_cb and frame_idx % 20 == 0:
+                self.progress_cb(n, meta.frame_count)
 
         # Ensure the very last frame is always predicted
         last_idx = n - 1
@@ -154,6 +162,8 @@ class ActionAwareSelector:
             pending.append((last_idx, self._build_clip(ring)))
 
         _flush()
+        if self.progress_cb:
+            self.progress_cb(n, meta.frame_count)
 
         if n == 0:
             raise ValueError(f"No frames in {video_path}")

@@ -15,8 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from common.metrics import action_label_stability, change_point_precision_recall, event_retention_rate
 from common.synthetic import make_action_aware_test_video
 

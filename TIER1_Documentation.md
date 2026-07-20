@@ -1,5 +1,17 @@
 # Action-Aware Video Pipeline
 
+> **Note (July 2026 refactor):** the face stack was unified into the `faces/`
+> package. Mapping: `fr_core.py` → `faces/persons.py` (PersonDetector),
+> `faces/engine.py` (SCRFD/ArcFace/align), `faces/tracker.py` (FaceTracker),
+> `faces/store.py` (MilvusFaceStore); `fr_annotate.py`/`face_recognizer.py` →
+> `faces/annotate.py`; `fr_milvus.py` → `faces/store.py`. YuNet and the
+> random-name annotator were removed. Kafka is OFF unless `--kafka true`
+> (there is no `--skip-kafka`). A FastAPI server now lives in `server/`.
+> Sections below may describe the pre-refactor layout; current architecture:
+> `README.md` and `CLAUDE.md`.
+
+
+
 A smart processor for surveillance / CCTV footage. It watches a video (or a live
 stream), **throws away the boring frames** where nothing changes, optionally
 **draws boxes and names** on the people it sees, **chops** the result into short
@@ -211,9 +223,9 @@ single run. Key blocks:
 |-----|---------|---------|
 | `enabled` | `true` | Publishing ON by default |
 | `required` | `false` | If true, abort when broker unreachable; if false, spool to disk |
-| `brokers` | `10.178.120.135:9092` | Broker address(es) |
+| `brokers` | `localhost:9092` | Broker address(es) |
 | `topic` | `semantic-chunks-data` | Kafka topic |
-| `assets_base` | `/jvadata/vst/assets` | Where chunks are written for consumers |
+| `assets_base` | `<assets_base>` | Where chunks are written for consumers |
 | `sp_enabled` / `critic_enabled` | `"true"` | Alert flags in the message |
 | `embed_frame_metadata` | `true` | Embed full per-frame list in each message (false = compact summary) |
 | `debug` | `broker,topic,msg,protocol` | librdkafka internal logging (set `""` to silence) |
@@ -233,7 +245,7 @@ Written to `--out-dir` (or `<video_dir>/action_aware_output/`):
 
 | File | Contents |
 |------|----------|
-| `<stem>_filtered.mp4` (or `/jvadata/vst/assets/<site>/<camera>/<run>.mp4`) | Filtered clip |
+| `<stem>_filtered.mp4` (or `<assets_base>/<site>/<camera>/<run>.mp4`) | Filtered clip |
 | `<stem>_annotated.mp4` | Stage-2 annotated clip |
 | `<stem>_kept_indices.json` | Which original frames were kept |
 | `<stem>_filter_metadata.json` | Model, device, reduction ratio, predictions, correlation timeline |
@@ -277,7 +289,7 @@ and **inside each Kafka message** under `event_metadata`.
   "run_id": "abc-123",
   "metadata": {
     "chunk_format": "mp4",
-    "path": "/jvadata/vst/assets/site-001/cam-001/<chunk_id>.mp4",
+    "path": "<assets_base>/site-001/cam-001/<chunk_id>.mp4",
     "sp_enabled": "true",
     "critic_enabled": "true",
     "alert_level": { "sp": "true", "critic": "true" }
@@ -287,8 +299,8 @@ and **inside each Kafka message** under `event_metadata`.
     "run_id": "abc-123", "site_id": "site-001", "camera_id": "cam-001",
     "start_timestamp": 1000000, "end_timestamp": 1005000,
     "source_fps": 30.0, "frame_count": 20,
-    "frames_sidecar": "/jvadata/.../<chunk_id>_frames.json",
-    "frames_metadata_file": "/jvadata/.../<run>_frames_metadata.json",
+    "frames_sidecar": "<assets_base>/.../<chunk_id>_frames.json",
+    "frames_metadata_file": "<assets_base>/.../<run>_frames_metadata.json",
     "frames": [
       {
         "frame_id": "...", "source_frame_number": 0, "filtered_index": 0,
@@ -311,7 +323,7 @@ and **inside each Kafka message** under `event_metadata`.
 ## Kafka behaviour & resilience
 
 - Publishing is **ON by default**. Turn it off with `--kafka false` (or
-  `skip_kafka: true` in config).
+  `kafka.enabled: false` in config).
 - Every step is logged to the console **and** `output/kafka_debug.log`, including
   low-level broker chatter (controlled by `kafka.debug`).
 - **No data loss if the broker is down:** when `required: false`, chunks are still
@@ -349,12 +361,12 @@ metadata, and a correlation timeline (how stable the scene is over time).
 
 ## Stage 2 — Detection & face recognition
 
-**In-pipeline detection** (`fr_annotate.py`): uses **YOLO** to box people, tracks
+**In-pipeline detection** (`faces/annotate.py`): uses **YOLO** to box people, tracks
 each across frames (IoU + colour re-identification so someone who leaves and
 returns keeps their box), and draws a **stable label** per track. Audio is
 passed through untouched.
 
-**Face-recognition toolkit** (`fr_*` + `face_recognizer.py`): a separate system to
+**Face-recognition toolkit** (`fr_*` + `faces/engine.py`): a separate system to
 identify *who* appears. It detects a face, aligns it, turns it into a 512-number
 "fingerprint" (ArcFace), and looks it up in **Milvus** (a vector database that
 finds the closest stored face). Named faces get **green** boxes; known-but-unnamed
@@ -368,7 +380,7 @@ Typical enrolment workflow:
 4. `fr_tag` — attach name / role / department (single or bulk CSV).
 5. `fr_onboard` — friendly all-in-one: add / list / delete / verify a person.
 
-(`fr_core.py` and `fr_milvus.py` hold the detection/embedding engines and DB helpers.)
+(`faces/ package` and `faces/store.py` hold the detection/embedding engines and DB helpers.)
 
 ---
 

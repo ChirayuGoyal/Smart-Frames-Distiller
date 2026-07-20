@@ -65,16 +65,31 @@ def do_ir_filter(
     frames: list[np.ndarray] = []
     motion_flags: list[bool] = []
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        # Apply ROI to the frame fed to the detector; full frame is kept for output
-        det_frame = frame if roi_mask is None else cv2.bitwise_and(frame, frame, mask=roi_mask)
-        result = detector.process_frame(det_frame)
-        frames.append(frame)        # original — written to output unchanged
-        motion_flags.append(result.is_motion)
-    cap.release()
+    # Server hooks: same contract as the action-aware path so night-mode jobs
+    # report progress and honour cancellation.
+    progress_cb = getattr(opts, "filter_progress_cb", None)
+    cancel_check = getattr(opts, "filter_cancel_check", None)
+    total_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    try:
+        while True:
+            if cancel_check:
+                cancel_check()
+            ok, frame = cap.read()
+            if not ok:
+                break
+            # Apply ROI to the frame fed to the detector; full frame is kept for output
+            det_frame = frame if roi_mask is None else cv2.bitwise_and(frame, frame, mask=roi_mask)
+            result = detector.process_frame(det_frame)
+            frames.append(frame)        # original — written to output unchanged
+            motion_flags.append(result.is_motion)
+            if progress_cb and len(frames) % 20 == 0:
+                progress_cb(len(frames), total_hint)
+    finally:
+        cap.release()
+
+    if progress_cb:
+        progress_cb(len(frames), total_hint or len(frames))
 
     actual_total = len(frames)
 

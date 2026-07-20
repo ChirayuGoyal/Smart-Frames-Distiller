@@ -1,57 +1,55 @@
 """Kafka publisher for semantic video chunks (confluent_kafka).
 
-Verbose Kafka-only logging: every step is written to BOTH the console and
-output/kafka_debug.log. librdkafka internal logs (broker connection, DNS,
-metadata, message delivery) are captured too via the `debug` setting.
+Library-safe: no logging handlers, files, or directories are created at
+import time. Debug logging to output/kafka_debug.log is opt-in via
+enable_kafka_debug_log(). Concurrency-safe: producer state lives in
+KafkaPublisher instances (internally locked), not module globals.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-_DEFAULT_BROKERS = "10.178.120.135:9092"
+_DEFAULT_BROKERS = "localhost:9092"
 _DEFAULT_TOPIC = "semantic-chunks-data"
 _DEFAULT_CLIENT_ID = "action-aware-chunk-producer"
+_DEFAULT_ASSETS_BASE = "assets"
 _CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
-_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-_PENDING_PATH = _OUTPUT_DIR / "kafka_pending.jsonl"
-_LOG_PATH = _OUTPUT_DIR / "kafka_debug.log"
+_DEFAULT_SPOOL_PATH = Path(__file__).resolve().parent / "output" / "kafka_pending.jsonl"
 
-_wrapper: Optional["KafkaProducerWrapper"] = None
+log = logging.getLogger("kafka_pipeline")
 
 
-# --------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------
-def _setup_logger() -> logging.Logger:
-    logger = logging.getLogger("kafka_pipeline")
-    if getattr(logger, "_kafka_configured", False):
-        return logger
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
+def enable_kafka_debug_log(log_dir: str | Path | None = None) -> None:
+    """Opt-in verbose Kafka logging to console + <log_dir>/kafka_debug.log.
+
+    Called by the CLI; servers configure logging themselves.
+    """
+    if getattr(log, "_kafka_configured", False):
+        return
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
     fmt = logging.Formatter(
         "%(asctime)s.%(msecs)03d %(levelname)-5s [kafka] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(_LOG_PATH, mode="a", encoding="utf-8")
+    out_dir = Path(log_dir) if log_dir else _DEFAULT_SPOOL_PATH.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(out_dir / "kafka_debug.log", mode="a", encoding="utf-8")
     fh.setFormatter(fmt)
     fh.setLevel(logging.DEBUG)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     sh.setLevel(logging.DEBUG)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
-    logger._kafka_configured = True  # type: ignore[attr-defined]
-    return logger
-
-
-log = _setup_logger()
+    log.addHandler(fh)
+    log.addHandler(sh)
+    log._kafka_configured = True  # type: ignore[attr-defined]
 
 
 def _mask(value: str) -> str:
@@ -117,7 +115,7 @@ def kafka_settings(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         "connect_retry_seconds": float(k.get("connect_retry_seconds", 2)),
         "sp_enabled": str(k.get("sp_enabled", "true")),
         "critic_enabled": str(k.get("critic_enabled", "true")),
-        "assets_base": str(k.get("assets_base", "/jvadata/vst/assets")).rstrip("/"),
+        "assets_base": str(k.get("assets_base", _DEFAULT_ASSETS_BASE)).rstrip("/"),
         # librdkafka debug contexts, e.g. "broker,topic,msg". Empty = off.
         "debug": str(k.get("debug", "") or "").strip(),
         # embed full per-frame metadata in each message (False = compact summary).
@@ -126,6 +124,8 @@ def kafka_settings(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         # each inherits from its *_enabled sibling.
         "sp":     str(k.get("sp",     "") or "").strip() or None,
         "critic": str(k.get("critic", "") or "").strip() or None,
+        # spool file for undeliverable payloads (required=false mode)
+        "spool_path": str(k.get("spool_path", "") or "").strip() or None,
     }
 
 
@@ -196,9 +196,7 @@ def _build_confluent_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "socket.timeout.ms": 10000,
         "message.timeout.ms": 30000,
         "error_cb": _error_cb,
-        "stats_cb": None,
     }
-    conf.pop("stats_cb", None)
     if cfg.get("debug"):
         conf["debug"] = cfg["debug"]
     protocol = str(cfg["security_protocol"]).upper()
@@ -228,6 +226,9 @@ def _log_effective_config(cfg: dict[str, Any]) -> None:
 
 
 class KafkaProducerWrapper:
+    """Thin wrapper over confluent_kafka.Producer. Not thread-safe on its own —
+    KafkaPublisher serializes access."""
+
     def __init__(self, cfg: dict[str, Any]):
         from confluent_kafka import Producer
 
@@ -239,11 +240,9 @@ class KafkaProducerWrapper:
         log.debug("creating Producer with librdkafka conf keys: %s", sorted(conf.keys()))
         try:
             self.producer = Producer(conf, logger=log)
-            log.debug("Producer constructed (librdkafka logs routed to kafka logger)")
         except TypeError:
             # Older confluent_kafka without logger kwarg
             self.producer = Producer(conf)
-            log.debug("Producer constructed (no logger kwarg支持; using error_cb only)")
 
     def delivery_callback(self, err, msg) -> None:
         if err:
@@ -281,23 +280,19 @@ class KafkaProducerWrapper:
         return True
 
     def flush(self, timeout: float = 10) -> bool:
-        log.debug("flush(timeout=%s) — waiting for broker acks", timeout)
         try:
             remaining = self.producer.flush(timeout)
             if remaining > 0:
                 self._last_error = f"{remaining} message(s) not delivered"
                 log.error("flush incomplete: %s still in queue (broker not acking)", remaining)
                 return False
-            ok = self._last_error is None
-            log.debug("flush complete: all messages drained, last_error=%s", self._last_error)
-            return ok
+            return self._last_error is None
         except Exception as exc:
             self._last_error = str(exc)
             log.error("flush() raised: %s", exc)
             return False
 
     def probe(self, timeout: float = 10) -> bool:
-        log.debug("probe: list_topics(timeout=%s) to verify broker reachability", timeout)
         try:
             md = self.producer.list_topics(timeout=timeout)
             self._last_error = None
@@ -317,85 +312,176 @@ class KafkaProducerWrapper:
             return False
 
 
-def _reset_wrapper() -> None:
-    global _wrapper
-    if _wrapper is not None:
+class KafkaPublisher:
+    """Thread-safe chunk publisher with spool-on-failure.
+
+    One instance per pipeline/server (or per job when overrides differ).
+    """
+
+    def __init__(
+        self,
+        cfg: dict[str, Any] | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+        spool_path: str | Path | None = None,
+    ):
+        self.cfg = cfg or kafka_settings(overrides)
+        self.spool_path = Path(
+            spool_path or self.cfg.get("spool_path") or _DEFAULT_SPOOL_PATH
+        )
+        self._lock = threading.Lock()
+        self._wrapper: Optional[KafkaProducerWrapper] = None
+        self.last_error: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg["enabled"])
+
+    # -- lifecycle ---------------------------------------------------------
+    def connect(self, *, wait: bool = True) -> bool:
+        """Establish a probed producer. False when broker unreachable
+        (caller decides based on cfg['required'])."""
+        if not self.enabled:
+            log.info("Kafka disabled (enabled=false) — skipping connection")
+            return True
+        _log_effective_config(self.cfg)
         try:
-            _wrapper.flush(2)
-        except Exception:
-            pass
-    _wrapper = None
+            import confluent_kafka  # noqa: F401
+        except ImportError:
+            self.last_error = "confluent-kafka not installed"
+            log.error("confluent-kafka NOT installed — run: pip install confluent-kafka")
+            return False
 
+        attempts = self.cfg["connect_retries"] if wait else 1
+        interval = self.cfg["connect_retry_seconds"]
+        for n in range(1, attempts + 1):
+            log.info("connection attempt %d/%d to %s", n, attempts, self.cfg["brokers"])
+            if self._ensure_wrapper(force_new=(n > 1)) is not None:
+                log.info("CONNECTED brokers=%s topic=%s", self.cfg["brokers"], self.cfg["topic"])
+                return True
+            if n < attempts:
+                log.warning("broker unreachable, retry %d/%d in %ss...", n, attempts, interval)
+                time.sleep(interval)
 
-def _get_wrapper(cfg: dict[str, Any], *, force_new: bool = False) -> Optional[KafkaProducerWrapper]:
-    global _wrapper
-    if force_new:
-        _reset_wrapper()
-    if _wrapper is not None:
-        return _wrapper
-    try:
-        wrapper = KafkaProducerWrapper(cfg)
-        if wrapper.probe(timeout=10):
-            _wrapper = wrapper
-            return _wrapper
-    except Exception as exc:
-        log.error("Producer init failed: %s", exc)
-    _reset_wrapper()
-    return None
-
-
-def _spool_payload(payload: dict[str, Any]) -> None:
-    _PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_PENDING_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str) + "\n")
-    log.warning("payload spooled to %s (NOT delivered to Kafka)", _PENDING_PATH)
-
-
-def _send_one(wrapper: KafkaProducerWrapper, payload: dict[str, Any], topic: str) -> bool:
-    if not wrapper.produce_json(payload, topic=topic):
-        log.error("produce failed: %s", wrapper._last_error)
+        msg = f"broker unreachable: {self.cfg['brokers']}"
+        self.last_error = msg
+        if self.cfg["required"]:
+            log.error("%s (required=true)", msg)
+        else:
+            log.warning("%s (required=false — continuing, chunks will spool)", msg)
         return False
-    if not wrapper.flush(10):
-        log.error("delivery failed: %s", wrapper._last_error)
-        return False
-    log.info("SENT chunk_id=%s event_id=%s topic=%s",
-             payload.get("chunk_id"), payload.get("event_id"), topic)
-    return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._reset_locked()
+
+    # -- publishing ---------------------------------------------------------
+    def publish(self, payload: dict[str, Any], *, topic: Optional[str] = None) -> bool:
+        """Produce + flush one payload. Spools and returns False on failure."""
+        if not self.enabled:
+            log.info("publish: Kafka disabled — chunk_id=%s NOT sent", payload.get("chunk_id"))
+            return True
+
+        t = topic or self.cfg["topic"]
+        with self._lock:
+            wrapper = self._ensure_wrapper_locked() or self._ensure_wrapper_locked(
+                force_new=True
+            )
+            if wrapper is None:
+                log.error(
+                    "publish: no producer (broker down) — spooling chunk_id=%s",
+                    payload.get("chunk_id"),
+                )
+                self._spool(payload)
+                return False
+            try:
+                ok = self._send_one_locked(wrapper, payload, t)
+            except Exception as exc:
+                log.error("publish raised (%s) — resetting producer and spooling", exc)
+                self.last_error = str(exc)
+                self._reset_locked()
+                self._spool(payload)
+                return False
+            if not ok:
+                self._spool(payload)
+            return ok
+
+    # -- internals -----------------------------------------------------------
+    def _ensure_wrapper(self, *, force_new: bool = False) -> Optional[KafkaProducerWrapper]:
+        with self._lock:
+            return self._ensure_wrapper_locked(force_new=force_new)
+
+    def _ensure_wrapper_locked(
+        self, *, force_new: bool = False
+    ) -> Optional[KafkaProducerWrapper]:
+        if force_new:
+            self._reset_locked()
+        if self._wrapper is not None:
+            return self._wrapper
+        try:
+            wrapper = KafkaProducerWrapper(self.cfg)
+            if wrapper.probe(timeout=10):
+                self._wrapper = wrapper
+                return self._wrapper
+            self.last_error = wrapper._last_error
+        except Exception as exc:
+            self.last_error = str(exc)
+            log.error("Producer init failed: %s", exc)
+        self._reset_locked()
+        return None
+
+    def _reset_locked(self) -> None:
+        if self._wrapper is not None:
+            try:
+                self._wrapper.flush(2)
+            except Exception:
+                pass
+        self._wrapper = None
+
+    def _send_one_locked(
+        self, wrapper: KafkaProducerWrapper, payload: dict[str, Any], topic: str
+    ) -> bool:
+        if not wrapper.produce_json(payload, topic=topic):
+            self.last_error = wrapper._last_error
+            log.error("produce failed: %s", wrapper._last_error)
+            return False
+        if not wrapper.flush(10):
+            self.last_error = wrapper._last_error
+            log.error("delivery failed: %s", wrapper._last_error)
+            return False
+        log.info("SENT chunk_id=%s event_id=%s topic=%s",
+                 payload.get("chunk_id"), payload.get("event_id"), topic)
+        return True
+
+    def _spool(self, payload: dict[str, Any]) -> None:
+        self.spool_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.spool_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+        log.warning("payload spooled to %s (NOT delivered to Kafka)", self.spool_path)
+
+
+# --------------------------------------------------------------------------
+# Legacy module-level API (CLI compatibility) — backed by one lazily-created
+# default publisher guarded by a lock.
+# --------------------------------------------------------------------------
+_default_publisher: Optional[KafkaPublisher] = None
+_default_lock = threading.Lock()
+
+
+def _get_default_publisher(cfg: dict[str, Any] | None = None) -> KafkaPublisher:
+    global _default_publisher
+    with _default_lock:
+        if _default_publisher is None or (
+            cfg is not None and cfg != _default_publisher.cfg
+        ):
+            _default_publisher = KafkaPublisher(cfg)
+        return _default_publisher
 
 
 def connect_kafka(*, wait: bool = True, overrides: dict[str, Any] | None = None) -> bool:
     cfg = kafka_settings(overrides)
     log.info("connect_kafka: enabled=%s required=%s wait=%s", cfg["enabled"], cfg["required"], wait)
-    if not cfg["enabled"]:
-        log.info("Kafka disabled (enabled=false) — skipping connection")
-        return True
-    _log_effective_config(cfg)
-    try:
-        import confluent_kafka
-        log.info("confluent_kafka version=%s", confluent_kafka.version())
-        from confluent_kafka import Producer  # noqa: F401
-    except ImportError:
-        log.error("confluent-kafka NOT installed — run: pip install confluent-kafka")
-        return False
-
-    attempts = cfg["connect_retries"] if wait else 1
-    interval = cfg["connect_retry_seconds"]
-    for n in range(1, attempts + 1):
-        log.info("connection attempt %d/%d to %s", n, attempts, cfg["brokers"])
-        wrapper = _get_wrapper(cfg, force_new=(n > 1))
-        if wrapper is not None:
-            log.info("CONNECTED brokers=%s topic=%s", cfg["brokers"], cfg["topic"])
-            return True
-        if n < attempts:
-            log.warning("broker unreachable, retry %d/%d in %ss...", n, attempts, interval)
-            time.sleep(interval)
-
-    msg = f"broker unreachable: {cfg['brokers']}"
-    if cfg["required"]:
-        log.error("%s (required=true)", msg)
-        return False
-    log.warning("%s (required=false — continuing, chunks will spool)", msg)
-    return False
+    return _get_default_publisher(cfg).connect(wait=wait)
 
 
 def publish_chunk(
@@ -404,23 +490,4 @@ def publish_chunk(
     topic: Optional[str] = None,
     cfg: dict[str, Any] | None = None,
 ) -> bool:
-    cfg = cfg or kafka_settings()
-    if not cfg["enabled"]:
-        log.info("publish_chunk: Kafka disabled — chunk_id=%s NOT sent", payload.get("chunk_id"))
-        return True
-
-    t = topic or cfg["topic"]
-    wrapper = _get_wrapper(cfg) or _get_wrapper(cfg, force_new=True)
-    if wrapper is None:
-        log.error("publish_chunk: no producer (broker down) — spooling chunk_id=%s", payload.get("chunk_id"))
-        _spool_payload(payload)
-        return False
-
-    try:
-        return _send_one(wrapper, payload, t)
-    except Exception as exc:
-        log.error("publish_chunk raised (%s) — resetting producer and spooling", exc)
-        _reset_wrapper()
-        _spool_payload(payload)
-        return False
-
+    return _get_default_publisher(cfg or kafka_settings()).publish(payload, topic=topic)

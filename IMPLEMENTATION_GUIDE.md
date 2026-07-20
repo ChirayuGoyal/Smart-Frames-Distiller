@@ -1,5 +1,17 @@
 # Action-Aware Frame Selection — Implementation Guide
 
+> **Note (July 2026 refactor):** the face stack was unified into the `faces/`
+> package. Mapping: `fr_core.py` → `faces/persons.py` (PersonDetector),
+> `faces/engine.py` (SCRFD/ArcFace/align), `faces/tracker.py` (FaceTracker),
+> `faces/store.py` (MilvusFaceStore); `fr_annotate.py`/`face_recognizer.py` →
+> `faces/annotate.py`; `fr_milvus.py` → `faces/store.py`. YuNet and the
+> random-name annotator were removed. Kafka is OFF unless `--kafka true`
+> (there is no `--skip-kafka`). A FastAPI server now lives in `server/`.
+> Sections below may describe the pre-refactor layout; current architecture:
+> `README.md` and `CLAUDE.md`.
+
+
+
 This document explains **only what is implemented** in `07-action-aware`: how the code works, the theory behind it, and enough detail to rebuild the system from scratch.
 
 ---
@@ -65,7 +77,7 @@ Given an input video, this POC:
   └─────────────┘   └────────┬────────┘  └─────────────────┘
                              │
                     ┌────────▼────────┐
-                    │  fr_annotate    │  (optional, if --detect)
+                    │  faces/annotate    │  (optional, if --detect)
                     │  OpenCV + FR    │
                     └─────────────────┘
 ```
@@ -86,9 +98,9 @@ Given an input video, this POC:
 | `correlation_plot.py` | Correlation timeline + matplotlib plot |
 | `chunk_exporter.py` | Split compressed video into chunks + frame metadata |
 | `kafka_producer.py` | Publish chunk events to Kafka (`confluent_kafka`) |
-| `face_recognizer.py` | SCRFD + ArcFace + Milvus (shared by FR tools) |
-| `fr_annotate.py` | OpenCV person detection + face recognition → annotated clip (used by `--detect`) |
-| `fr_core.py` | YOLOv8n person detector + YuNet face detector + ArcFace embedder + IoUTracker |
+| `faces/engine.py` | SCRFD + ArcFace + Milvus (shared by FR tools) |
+| `faces/annotate.py` | OpenCV person detection + face recognition → annotated clip (used by `--detect`) |
+| `faces/ package` | YOLOv8n person detector + YuNet face detector + ArcFace embedder + IoUTracker |
 | `fr_onboard.py` | Enroll a person into Milvus from a still/video |
 | `fr_discover.py` | Scan video → cluster unique faces → register by UUID |
 | `fr_ingest.py` | Ingest faces from video into Milvus |
@@ -207,7 +219,7 @@ R3D-18 is the practical stand-in documented in `action_model.py` comments. **X3D
 9. Optional: plot_correlation_timeline()
 10. Optional: write_annotated_video()       ← common/visualize.py
 11. Optional: write_kept_video()            ← common/video_io.py
-12. Optional: annotate_video()              ← fr_annotate.py  (--detect)
+12. Optional: annotate_video()              ← faces/annotate.py  (--detect)
 13. Optional: split_and_publish_chunks()    ← chunk_exporter.py
 14. merge_benchmark_into_report()           ← common/benchmark.py
 15. Write report JSON to disk
@@ -383,7 +395,7 @@ D:/videos/action_aware_output/
 
 After compression, split the filtered MP4 into **fixed-duration chunks** (default 5 seconds), save them, attach per-frame metadata, and optionally publish one Kafka message per chunk.
 
-Chunking works **independently of Kafka** (`--chunks-dir` saves UUID-named `.mp4` files even with `--skip-kafka`).
+Chunking works **independently of Kafka** (`--chunks-dir` saves UUID-named `.mp4` files even with omitting `--kafka true` (Kafka is off by default)).
 
 ### 10.2 Flow (`split_and_publish_chunks`)
 
@@ -396,14 +408,14 @@ Chunking works **independently of Kafka** (`--chunks-dir` saves UUID-named `.mp4
 6. When buffer reaches frames_per_chunk (or EOF):
    a. chunk_id = UUID
    b. Write chunk MP4 to:
-      - jvadata path (if Kafka on): {assets_base}/{site_id}/{camera_id}/{chunk_id}.mp4
+      - assets path (if Kafka on): {assets_base}/{site_id}/{camera_id}/{chunk_id}.mp4
       - chunks_dir (if set): {chunks_dir}/{chunk_id}.mp4
    c. Build per-frame metadata (see below)
    d. Write sidecar: {chunk}.frames.json
    e. Build Kafka message via build_chunk_message()
    f. Add event_metadata (full or summary frames)
    g. publish_chunk() if Kafka on
-7. Write run-level {stem}_frames_metadata.json (local + jvadata copy if Kafka on)
+7. Write run-level {stem}_frames_metadata.json (local + assets copy if Kafka on)
 ```
 
 ### 10.3 Per-Frame Metadata Record
@@ -438,7 +450,7 @@ Each kept frame in a chunk gets:
   "end_timestamp": 1710000005000,
   "metadata": {
     "chunk_format": "mp4",
-    "path": "/jvadata/vst/assets/site-001/cam-001/<chunk_id>.mp4",
+    "path": "<assets_base>/site-001/cam-001/<chunk_id>.mp4",
     "sp_enabled": "true",
     "critic_enabled": "true",
     "alert_level": { "sp": "true", "critic": "true" }
@@ -467,10 +479,10 @@ no NVIDIA DeepStream, no GStreamer, no `pyds`.
 When `--detect` is passed:
 
 1. Runs on the filtered clip (output of `--filter`) or directly on the source clip.
-2. Calls `fr_annotate.annotate_video(clip, output_path, cfg)`.
+2. Calls `faces.annotate.annotate_video(clip, output_path, cfg)`.
 3. Output: `{stem}_detection.mp4` — person bounding boxes labelled with recognised names.
 
-### 11.2 OpenCV Detection Pipeline (`fr_annotate.py` + `fr_core.py`)
+### 11.2 OpenCV Detection Pipeline (`faces/annotate.py` + `faces/ package`)
 
 ```
 cv2.VideoCapture → per-frame loop
@@ -496,7 +508,7 @@ cv2.VideoCapture → per-frame loop
 - Soft ellipse mask on the 112×112 face crop suppresses background before embedding.
 - `IoUTracker` smooths noisy identity assignments across frames.
 
-### 11.3 Face Models (`fr_core.py`)
+### 11.3 Face Models (`faces/ package`)
 
 | Model | File | Role |
 |-------|------|------|
@@ -603,16 +615,16 @@ Runs with motion fallback always; also with R3D-18 if torch installed.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `kafka.enabled` | `true` | Publish chunks (use `--skip-kafka` to disable) |
-| `kafka.brokers` | `10.178.120.135:9092` | Bootstrap servers |
+| `kafka.enabled` | `true` | Publish chunks (use omitting `--kafka true` (Kafka is off by default) to disable) |
+| `kafka.brokers` | `localhost:9092` | Bootstrap servers |
 | `kafka.topic` | `semantic-chunks-data` | Topic name |
-| `kafka.assets_base` | `/jvadata/vst/assets` | Chunk storage root |
+| `kafka.assets_base` | `<assets_base>` | Chunk storage root |
 | `kafka.embed_frame_metadata` | `true` | Full frames in message vs summary |
 | `camera_id`, `site_id` | required if Kafka on | Identifiers in messages |
 | `chunk_duration_sec` | `5` | Chunk length in seconds |
 | `run_id` | `test-run-12345` | Run identifier |
 | `chunks_dir` | `""` | Local folder for UUID chunks |
-| `skip_kafka` | `false` | Disable Kafka in config |
+| `kafka.enabled` | `false` | Disable Kafka in config |
 
 ### 13.4 Face Recognition
 
@@ -654,9 +666,9 @@ python main.py /path/to/video.mp4 --annotate
 | `--sample-stride 12` | Fewer model calls |
 | `--no-annotate` | Skip annotated video |
 | `--no-compressed` | Skip compressed video |
-| `--skip-kafka` | Disable Kafka (chunks_dir still works) |
+| omitting `--kafka true` (Kafka is off by default) | Disable Kafka (chunks_dir still works) |
 | `--chunks-dir /path/to/chunks` | Save local chunk MP4s |
-| `--save-full-clip /jvadata/.../full/N2.mp4` | Copy whole filtered clip |
+| `--save-full-clip <assets_base>/.../full/N2.mp4` | Copy whole filtered clip |
 | `--detect` | Enable face recognition annotation (YOLOv8n + YuNet + ArcFace) |
 | `--plot-correlation` | Save correlation PNG |
 

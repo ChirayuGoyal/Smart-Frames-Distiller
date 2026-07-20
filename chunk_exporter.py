@@ -23,7 +23,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 
@@ -33,19 +33,13 @@ try:
 except ImportError:
     _TQDM = False
 
-import sys
-
-_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_ROOT))
-
 from common.video_io import read_video_meta, mux_audio_to_video, try_reencode_h264
 
 from kafka_producer import (
+    KafkaPublisher,
     build_chunk_message,
     chunk_asset_path,
-    connect_kafka,
     kafka_settings,
-    publish_chunk,
     log,
 )
 
@@ -75,15 +69,21 @@ def _write_chunk_video(
         fps,
         (final_w, final_h),
     )
-    if not writer.isOpened():
-        raise RuntimeError(f"Cannot create chunk video writer: {cv_path}")
-    for frame in frames:
-        if final_w != width or final_h != height:
-            frame = cv2.resize(frame, (final_w, final_h))
-        writer.write(frame)
-    writer.release()
+    try:
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot create chunk video writer: {cv_path}")
+        for frame in frames:
+            if final_w != width or final_h != height:
+                frame = cv2.resize(frame, (final_w, final_h))
+            writer.write(frame)
+    except Exception:
+        writer.release()
+        cv_path.unlink(missing_ok=True)
+        raise
+    else:
+        writer.release()
 
-    ok = try_reencode_h264(cv_path, fps=fps)   # converts cv_path in-place, resamples to fps
+    ok = try_reencode_h264(cv_path, fps=fps) if reencode_h264 else True
     cv_path.replace(dst_path)                 # move result to final path
     if not ok:
         log.warning("chunk re-encode failed — output may not be web-compatible: %s", dst_path)
@@ -152,6 +152,9 @@ def split_and_publish_chunks(
     chunk_width: int | None = None,
     chunk_height: int | None = None,
     output_fps: float | None = None,
+    publisher: KafkaPublisher | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """
     Split filtered MP4 into chunk_duration_sec segments, build frame-level
@@ -190,8 +193,10 @@ def split_and_publish_chunks(
     if full_clip_dest:
         full_clip_path = _save_full_clip(filtered_video, full_clip_dest)
 
+    if publisher is None:
+        publisher = KafkaPublisher(cfg)
     if kafka_on:
-        if not connect_kafka(wait=True, overrides=kafka_overrides):
+        if not publisher.connect(wait=True):
             if cfg["required"]:
                 log.error("Kafka required but broker unreachable — aborting chunk export")
                 raise RuntimeError("Kafka connection required but broker unreachable")
@@ -222,10 +227,12 @@ def split_and_publish_chunks(
         asset_path = chunk_asset_path(site_id, camera_id, chunk_id, assets_base)
 
         targets: list[Path] = []
+        if kafka_on:
+            # Kafka advertises asset_path, so it must be written before any
+            # optional local copy is attempted.
+            targets.append(Path(asset_path))
         if chunks_dir_path is not None:
-            targets.append(chunks_dir_path / f"{chunk_id}.mp4")   # user dir — exclusive
-        elif kafka_on:
-            targets.append(Path(asset_path))                        # jvadata default
+            targets.append(chunks_dir_path / f"{chunk_id}.mp4")
         if not targets:
             targets.append(Path(asset_path))                        # last-resort fallback
 
@@ -252,8 +259,10 @@ def split_and_publish_chunks(
             log.error("chunk %d: chunk_id=%s could not be saved to any target", index, chunk_id)
             return
 
-        # Mux audio from filtered clip for this chunk's time window
-        chunk_start_sec = index * chunk_duration_sec
+        # Mux audio from filtered clip for this chunk's time window.
+        # Use the real frame cursor, not index*duration — the last (short)
+        # chunk would otherwise drift.
+        chunk_start_sec = frame_cursor / meta.fps if meta.fps else 0.0
         chunk_end_sec   = chunk_start_sec + (len(frames) / meta.fps if meta.fps else 0)
         mux_audio_to_video(
             written_to, filtered_video,
@@ -289,7 +298,9 @@ def split_and_publish_chunks(
         all_frames_meta.extend(frames_meta)
 
         duration_ms = int(round(len(frames) / meta.fps * 1000)) if meta.fps > 0 else chunk_ms
-        start_ts = base_ts + index * chunk_ms
+        # Anchor to the chunk's real first-frame time (g0/fps), not index*chunk_ms —
+        # short/last chunks would otherwise skew every later start timestamp.
+        start_ts = base_ts + (int(round(g0 / meta.fps * 1000)) if meta.fps > 0 else index * chunk_ms)
         end_ts = start_ts + duration_ms
 
         # Full frame-level metadata -> sidecar files + run-level JSON.
@@ -356,7 +367,7 @@ def split_and_publish_chunks(
         if kafka_on:
             log.info("chunk %d: %d frames (%d frame-meta) -> publishing chunk_id=%s",
                      index, len(frames), len(frames_meta), chunk_id)
-            published = publish_chunk(message, cfg=cfg)
+            published = publisher.publish(message)
         else:
             log.info("chunk %d: %d frames (%d frame-meta) -> saved (chunks-only) chunk_id=%s",
                      index, len(frames), len(frames_meta), chunk_id)
@@ -383,22 +394,30 @@ def split_and_publish_chunks(
         dynamic_ncols=True, leave=True,
     ) if _TQDM else None
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            _flush_chunk(buffer, chunk_index)
-            break
-        buffer.append(frame)
+    try:
+        while True:
+            if cancel_check:
+                cancel_check()
+            ok, frame = cap.read()
+            if not ok:
+                _flush_chunk(buffer, chunk_index)
+                break
+            buffer.append(frame)
+            if _bar:
+                _bar.update(1)
+            if progress_cb and frame_cursor % 20 == 0:
+                progress_cb(frame_cursor, meta.frame_count)
+            if len(buffer) >= frames_per_chunk:
+                _flush_chunk(buffer, chunk_index)
+                buffer = []
+                chunk_index += 1
+    finally:
         if _bar:
-            _bar.update(1)
-        if len(buffer) >= frames_per_chunk:
-            _flush_chunk(buffer, chunk_index)
-            buffer = []
-            chunk_index += 1
+            _bar.close()
+        cap.release()
 
-    if _bar:
-        _bar.close()
-    cap.release()
+    if progress_cb:
+        progress_cb(frame_cursor, meta.frame_count)
 
     total = len(records)
     published = sum(1 for r in records if r["kafka_published"])
