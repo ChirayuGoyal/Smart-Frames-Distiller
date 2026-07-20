@@ -105,6 +105,8 @@ def main() -> int:
                        help="Camera identifier  e.g. cam-001")
     ident.add_argument("--run",    default=None, metavar="RUN_ID",
                        help="Run UUID for this clip  e.g. abc-123")
+    ident.add_argument("--app-id", type=int, default=None, metavar="APP_ID",
+                       help="Application identifier  e.g. 1024  (default: from config, else 0)")
 
     # ── Filter options ────────────────────────────────────────────────────────
     flt = p.add_argument_group("Filter options")
@@ -144,6 +146,9 @@ def main() -> int:
                      help="Max px on longest inference side  (default 480)")
     flt.add_argument("--scale",          type=float, default=None,
                      help="Inference scale factor  e.g. 0.5")
+    flt.add_argument("--roi",            type=Path, default=None, metavar="ROI_JSON",
+                     help="LabelMe JSON with polygon/rectangle ROI — detection runs only inside "
+                          "this region; output video still shows the full frame")
 
     # ── Chunk options ─────────────────────────────────────────────────────────
     chk = p.add_argument_group("Chunk options")
@@ -257,8 +262,9 @@ def main() -> int:
     if args.site:
         opts.site_id = args.site
         opts.face_recognition_cfg = {**opts.face_recognition_cfg, "site_id": args.site}
-    if args.camera: opts.camera_id          = args.camera
-    if args.run:    opts.run_id             = args.run
+    if args.camera:  opts.camera_id = args.camera
+    if args.run:     opts.run_id    = args.run
+    if args.app_id is not None: opts.app_id = args.app_id
 
     # Filter
     # Only override config when the flag was actually passed
@@ -280,6 +286,10 @@ def main() -> int:
     if args.audio_delta_z is not None: opts.audio_delta_z = args.audio_delta_z
     if args.max_side:    opts.inference_max_side  = args.max_side
     if args.scale:       opts.inference_scale     = args.scale
+    if args.roi is not None:
+        if not args.roi.is_file():
+            p.error(f"--roi file not found: {args.roi}")
+        opts.roi_path = str(args.roi)
     opts.plot_correlation = args.plot_correlation or opts.plot_correlation
 
     # Chunk

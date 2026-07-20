@@ -40,6 +40,14 @@ class JobOptions(BaseModel):
     # Server / stage options
     overwrite: bool = False
 
+    # Day/night + ROI (see day_night_detector.py, roi_loader.py)
+    view_mode: str = "auto"                 # auto | day | night
+    roi_path: str | None = None             # LabelMe JSON restricting detection
+    ir_mode_cfg: dict[str, Any] = Field(default_factory=dict)
+    day_night_sat_threshold: float = 30.0
+    day_night_sample_frames: int = 30
+    app_id: int = 0
+
     # Stage configs
     face_recognition_cfg: dict[str, Any] = Field(default_factory=dict)
     kafka_cfg: dict[str, Any] = Field(default_factory=dict)
@@ -64,6 +72,8 @@ class JobOptions(BaseModel):
 
     @model_validator(mode="after")
     def validate_stage_rules(self) -> JobOptions:
+        if self.view_mode not in ("auto", "day", "night"):
+            raise ValueError("view_mode must be one of: auto, day, night")
         if not (self.filter_enabled or self.detection_enabled or self.chunk_enabled):
             raise ValueError("No stage selected — set at least one of: filter_enabled, detection_enabled, chunk_enabled")
         if self.kafka_enabled and not self.chunk_enabled:

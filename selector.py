@@ -63,6 +63,7 @@ class ActionAwareSelector:
         model_cache_dir: str | None = None,
         progress_cb: Callable[[int, int], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
+        roi_mask: np.ndarray | None = None,   # uint8 mask (h,w); 255=inside ROI
     ):
         self.clip_len = clip_len
         self.sample_stride = sample_stride
@@ -78,6 +79,7 @@ class ActionAwareSelector:
         self.audio_delta_z = audio_delta_z
         self.progress_cb = progress_cb
         self.cancel_check = cancel_check
+        self.roi_mask      = roi_mask
         self.model = model or create_action_model(
             clip_len=clip_len, prefer_torch=prefer_torch, device=self.device,
             ensemble=ensemble, model_path=model_path, cache_dir=model_cache_dir,
@@ -135,7 +137,11 @@ class ActionAwareSelector:
         for frame_idx, frame in _frame_iter:
             if self.cancel_check:
                 self.cancel_check()
-            resized = resize_for_inference(frame, self.inference_scale, self.inference_max_side)
+            inf_frame = frame
+            if self.roi_mask is not None:
+                from roi_loader import apply_roi_mask
+                inf_frame = apply_roi_mask(frame, self.roi_mask)
+            resized = resize_for_inference(inf_frame, self.inference_scale, self.inference_max_side)
             if inference_size is None:
                 h, w = resized.shape[:2]
                 inference_size = (w, h)

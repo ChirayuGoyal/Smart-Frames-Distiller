@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from runner import JobCancelled, RunOptions, run_action_aware
-from server.errors import JobCancelledError, JobNotCancellableError, JobNotFoundError
+from server.errors import (
+    JobCancelledError,
+    JobNotCancellableError,
+    JobNotFoundError,
+    PathNotAllowedError,
+)
 from server.model_cache import (
     get_action_model,
     get_face_store,
@@ -184,6 +189,21 @@ class JobManager:
             return True
         return False
 
+    def _check_roi_path(self, roi_path: str | None) -> str | None:
+        """ROI JSON is a client-supplied server-side path — hold it to the same
+        allowlist as video inputs so it cannot be used to probe the filesystem."""
+        if not roi_path:
+            return None
+        if not self.settings.allowed_input_dirs:
+            raise PathNotAllowedError(roi_path)
+        p = Path(roi_path).resolve()
+        allowed = [d.resolve() for d in self.settings.allowed_input_dirs]
+        if not any(p.is_relative_to(a) for a in allowed):
+            raise PathNotAllowedError(roi_path)
+        if not p.is_file():
+            raise JobNotFoundError(f"ROI file not found: {roi_path}")
+        return str(p)
+
     def _update_progress(self, job_id: str, stage: str, frac: float, message: str) -> None:
         with self._lock:
             record = self._jobs.get(job_id)
@@ -291,6 +311,12 @@ class JobManager:
                         visualization=options.visualization,
                         model_path=options.model_path,
                         model_cache_dir=options.model_cache_dir,
+                        view_mode=options.view_mode,
+                        roi_path=self._check_roi_path(options.roi_path),
+                        ir_mode_cfg=options.ir_mode_cfg,
+                        day_night_sat_threshold=options.day_night_sat_threshold,
+                        day_night_sample_frames=options.day_night_sample_frames,
+                        app_id=options.app_id,
                         overwrite=options.overwrite,
                         cancel_event=cancel_event,
                         progress_cb=lambda st, fr, msg: self._update_progress(job_id, st, fr, msg),
